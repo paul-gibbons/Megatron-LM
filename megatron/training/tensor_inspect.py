@@ -43,12 +43,20 @@ except (ImportError, ModuleNotFoundError):
 
 
 def _get_default_feature_dirs() -> List[str]:
-    """Get default feature directories from installed packages."""
-    feature_dirs = []
-    try:
-        import importlib
-        from pathlib import Path
+    import importlib
+    from pathlib import Path
 
+    feature_dirs = []
+
+    try:
+        mcore_features_mod = importlib.import_module("megatron.core.debug.features")
+        mcore_features_dir = Path(mcore_features_mod.__file__).parent
+        if mcore_features_dir.exists():
+            feature_dirs.append(str(mcore_features_dir))
+    except Exception:
+        pass
+
+    try:
         te_features_mod = importlib.import_module("transformer_engine.debug.features")
         te_features_dir = Path(te_features_mod.__file__).parent
         if te_features_dir.exists():
@@ -57,9 +65,6 @@ def _get_default_feature_dirs() -> List[str]:
         pass
 
     try:
-        import importlib
-        from pathlib import Path
-
         nv_features_mod = importlib.import_module("nvdlfw_inspect.debug_features")
         nv_features_dir = Path(nv_features_mod.__file__).parent
         if nv_features_dir.exists():
@@ -70,8 +75,15 @@ def _get_default_feature_dirs() -> List[str]:
     return feature_dirs
 
 
+def _clean_metric_name(name: str) -> str:
+    prefixes = ["model.module.module.", "model.module.", "model."]
+    for prefix in prefixes:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
 def _maybe_attach_metric_loggers(tensorboard_logger: Any, wandb_logger: Any) -> None:
-    """Attach TensorBoard and W&B loggers to nvdlfw_inspect."""
     if not HAVE_NVINSPECT:
         return
 
@@ -90,7 +102,8 @@ def _maybe_attach_metric_loggers(tensorboard_logger: Any, wandb_logger: Any) -> 
                     self._wandb = wandb_module
 
                 def log_scalar(self, name: str, value: float, iteration: int, **kwargs):
-                    self._wandb.log({name: value}, step=iteration)
+                    clean_name = _clean_metric_name(name)
+                    self._wandb.log({clean_name: value}, step=iteration)
 
             MetricLogger.add_logger(_WandbModuleLogger(wandb_logger))
 
@@ -105,7 +118,6 @@ def initialize_tensor_inspect_pre_model(
     log_dir: Optional[str] = None,
     init_training_step: int = 0,
 ) -> None:
-    """Initialize NVIDIA-DL-Framework-Inspect before model construction."""
     if not enabled:
         return
 
@@ -133,7 +145,6 @@ def finalize_tensor_inspect_post_model(
     wandb_logger: Any = None,
     current_training_step: Optional[int] = None,
 ) -> None:
-    """Finalize tensor inspection setup after model creation."""
     if not enabled:
         return
 
@@ -153,7 +164,6 @@ def finalize_tensor_inspect_post_model(
 
 
 def tensor_inspect_step(enabled: bool) -> None:
-    """Advance the tensor inspection step counter."""
     if not enabled:
         return
 
@@ -164,7 +174,6 @@ def tensor_inspect_step(enabled: bool) -> None:
 
 
 def tensor_inspect_end(enabled: bool) -> None:
-    """Shutdown tensor inspection."""
     if not enabled or not HAVE_NVINSPECT:
         return
 

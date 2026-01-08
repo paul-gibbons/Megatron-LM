@@ -1,0 +1,49 @@
+# Combined FP8 + MCore Tensor Stats
+# Usage: --tensor-inspect --tensor-inspect-config examples/configs/fp8_mcore_combined.yaml
+
+fp8_stats:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: ".*\\.linear_.*"
+  transformer_engine:
+    LogFp8TensorStats:
+      enabled: True
+      tensors: [weight, gradient]
+      stats: ["underflows%"]
+      freq: 10
+      start_step: 1
+    LogTensorStats:
+      enabled: True
+      tensors: [wgrad, dgrad]
+      stats: [dynamic_range]
+      freq: 10
+      start_step: 1
+
+mcore_router:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: ".*\\.mlp\\.router"
+  megatron_core:
+    LogMCoreTensorStats:
+      enabled: True
+      tensors_struct:
+        - tensor: logits
+          stats: [min, max, mean]
+        - tensor: probs
+          stats: [min, max, mean, sparsity]
+        - tensor: tokens
+          stats: [min, max, median, max_median_ratio, per_element%]
+      freq: 10
+      start_step: 1
+
+mcore_io:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: "^(embedding|output_layer)$"
+  megatron_core:
+    LogMCoreTensorStats:
+      enabled: True
+      tensors: [word, output, input, logits]
+      stats: [min, max, mean]
+      freq: 10
+      start_step: 1

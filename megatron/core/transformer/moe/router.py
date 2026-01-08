@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from megatron.core.debug.utils import TensorInspectMixin
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
@@ -127,7 +128,7 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
 
 
-class TopKRouter(Router):
+class TopKRouter(Router, TensorInspectMixin):
     """Route each token to the top-k experts.
 
     The workflow of TopKRouter is as follows:
@@ -211,6 +212,15 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+
+    def _get_debug_name(self) -> str:
+        if self._debug_name is None:
+            layer_num = self.layer_number if self.layer_number is not None else 0
+            self._debug_name = f"decoder.layers.{layer_num}.mlp.router"
+        return self._debug_name
+
+    def _get_reduction_group(self):
+        return self.tp_cp_group
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -506,6 +516,8 @@ class TopKRouter(Router):
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
+        self._inspect_tensor("logits", logits)
+
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
 
@@ -525,6 +537,9 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
             )
 
+        self._inspect_tensor("probs", probs)
+        self._inspect_tensor("map", routing_map.float())
+
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
@@ -542,6 +557,9 @@ class TopKRouter(Router):
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
             )
+
+            self._inspect_tensor("scores", scores_for_aux_loss)
+
             probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
             probs = self._apply_seq_aux_loss(
                 probs, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz
@@ -550,8 +568,10 @@ class TopKRouter(Router):
                 probs, scores_for_aux_loss, routing_map_for_aux_loss
             )
 
-        # Optionally apply expert bias
         self._apply_expert_bias(routing_map)
+
+        tokens_per_expert = routing_map.sum(dim=0).float()
+        self._inspect_tensor("tokens", tokens_per_expert)
 
         return probs, routing_map
 
@@ -569,6 +589,8 @@ class TopKRouter(Router):
             input (torch.Tensor): Input tensor.
         """
         self._maintain_float32_expert_bias()
+
+        self._inspect_tensor("weight", self.weight)
 
         # Apply input jitter
         input = self.apply_input_jitter(input)

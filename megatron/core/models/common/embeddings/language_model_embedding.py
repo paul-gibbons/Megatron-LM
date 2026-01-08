@@ -6,12 +6,13 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.debug.utils import TensorInspectMixin
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, nvtx_decorator
 
 
-class LanguageModelEmbedding(MegatronModule):
+class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
     """Language model embeddings.
 
     Args:
@@ -95,6 +96,14 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
 
+    def _get_debug_name(self) -> str:
+        if self._debug_name is None:
+            self._debug_name = "embedding"
+        return self._debug_name
+
+    def _get_reduction_group(self):
+        return self.tp_group
+
     @nvtx_decorator()
     def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
         """Forward pass of the embedding module.
@@ -109,8 +118,11 @@ class LanguageModelEmbedding(MegatronModule):
             Tensor: The output embeddings
         """
         word_embeddings = self.word_embeddings(input_ids)
+        self._inspect_tensor("word", word_embeddings)
+
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
+            self._inspect_tensor("position", position_embeddings)
             embeddings = word_embeddings + position_embeddings
         else:
             embeddings = word_embeddings
@@ -123,9 +135,12 @@ class LanguageModelEmbedding(MegatronModule):
             assert self.tokentype_embeddings is not None
             # [b s h] -> [s b h] (So that it can be added with embeddings)
             tokentype_embedding = self.tokentype_embeddings(tokentype_ids).permute(1, 0, 2)
+            self._inspect_tensor("tokentype", tokentype_embedding)
             embeddings = embeddings + tokentype_embedding
         else:
             assert self.tokentype_embeddings is None
+
+        self._inspect_tensor("output", embeddings)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
