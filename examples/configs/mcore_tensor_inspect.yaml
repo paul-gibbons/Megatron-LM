@@ -1,0 +1,80 @@
+# MCore Tensor Inspection Configuration
+# Usage: --tensor-inspect --tensor-inspect-config examples/configs/mcore_tensor_inspect.yaml
+
+# Router stats - matches decoder.layers.{n}.mlp.router
+mcore_router_stats:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: ".*\\.mlp\\.router"
+  megatron_core:
+    LogMCoreTensorStats:
+      enabled: True
+      tensors_struct:
+        - tensor: logits
+          stats: [min, max, mean, std, dynamic_range]
+        - tensor: probs
+          stats: [min, max, mean, std, sparsity]
+        - tensor: map
+          stats: [min, max, mean, sparsity]
+        - tensor: scores
+          stats: [min, max, mean, std]
+        - tensor: weight
+          stats: [min, max, mean, std, dynamic_range]
+        - tensor: tokens
+          stats:
+            - min
+            - max
+            - mean
+            - std
+            - median
+            - q1
+            - q3
+            - max_median_ratio
+            - per_element
+      freq: 10
+      start_step: 1
+      end_step: 10000
+
+# Embedding stats - matches embedding
+mcore_embedding_stats:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: "^embedding$"
+  megatron_core:
+    LogMCoreTensorStats:
+      enabled: True
+      tensors:
+        - word
+        - position
+        - tokentype
+        - output
+      stats:
+        - min
+        - max
+        - mean
+        - std
+        - l2_norm
+      freq: 10
+      start_step: 1
+      end_step: 10000
+
+# Output layer stats - matches output_layer
+mcore_output_stats:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: "^output_layer$"
+  megatron_core:
+    LogMCoreTensorStats:
+      enabled: True
+      tensors:
+        - input
+        - logits
+      stats:
+        - min
+        - max
+        - mean
+        - std
+        - dynamic_range
+      freq: 10
+      start_step: 1
+      end_step: 10000

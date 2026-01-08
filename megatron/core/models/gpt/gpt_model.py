@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.debug.utils import TensorInspectMixin
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
@@ -42,7 +43,7 @@ from megatron.core.utils import (
 )
 
 
-class GPTModel(LanguageModule):
+class GPTModel(LanguageModule, TensorInspectMixin):
     """GPT Transformer language model.
 
     Args:
@@ -280,6 +281,14 @@ class GPTModel(LanguageModule):
 
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
+
+    def _get_debug_name(self) -> str:
+        if self._debug_name is None:
+            self._debug_name = "output_layer"
+        return self._debug_name
+
+    def _get_reduction_group(self):
+        return self.pg_collection.tp if hasattr(self, 'pg_collection') else None
 
     def _preprocess(
         self,
@@ -649,16 +658,20 @@ class GPTModel(LanguageModule):
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
 
-                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
+                # Reshape [B, 1, H] to [1, B, H] → extract each sample's true last‐token hidden
                 # state ([B, H]) → unsqueeze back to [B, 1, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
+        self._inspect_tensor("input", hidden_states)
+
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        self._inspect_tensor("logits", logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
