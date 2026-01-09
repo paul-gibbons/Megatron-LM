@@ -516,7 +516,7 @@ class TopKRouter(Router, TensorInspectMixin):
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
-        self._inspect_tensor("logits", logits)
+        self._inspect_tensor("router_logits", logits)
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
@@ -537,8 +537,8 @@ class TopKRouter(Router, TensorInspectMixin):
                 fused=self.config.moe_router_fusion,
             )
 
-        self._inspect_tensor("probs", probs)
-        self._inspect_tensor("map", routing_map.float())
+        self._inspect_tensor("router_probs", probs)
+        self._inspect_tensor("routing_map", routing_map.float())
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -558,7 +558,7 @@ class TopKRouter(Router, TensorInspectMixin):
                 logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
             )
 
-            self._inspect_tensor("scores", scores_for_aux_loss)
+            self._inspect_tensor("routing_scores", scores_for_aux_loss)
 
             probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
             probs = self._apply_seq_aux_loss(
@@ -571,7 +571,7 @@ class TopKRouter(Router, TensorInspectMixin):
         self._apply_expert_bias(routing_map)
 
         tokens_per_expert = routing_map.sum(dim=0).float()
-        self._inspect_tensor("tokens", tokens_per_expert)
+        self._inspect_tensor("tokens_per_expert", tokens_per_expert)
 
         return probs, routing_map
 
@@ -590,7 +590,7 @@ class TopKRouter(Router, TensorInspectMixin):
         """
         self._maintain_float32_expert_bias()
 
-        self._inspect_tensor("weight", self.weight)
+        self._inspect_tensor("router_weight", self.weight)
 
         # Apply input jitter
         input = self.apply_input_jitter(input)

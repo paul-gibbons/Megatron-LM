@@ -27,8 +27,14 @@ mcore_router:
     LogMCoreTensorStats:
       enabled: True
       tensors_struct:
-        - tensor: tokens
-          stats: [per_element%]
+        - tensor: tokens_per_expert
+          stats: [per_element%, num_zeros%]
+        - tensor: router_probs
+          stats: [entropy]
+        - tensor: router_logits
+          stats: [mean, std, kurtosis]
+        - tensor: router_weight
+          stats: [mean, std, l2_norm]
       freq: 10
       start_step: 1
 
