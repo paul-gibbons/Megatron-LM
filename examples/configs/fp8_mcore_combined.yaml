@@ -27,12 +27,8 @@ mcore_router:
     LogMCoreTensorStats:
       enabled: True
       tensors_struct:
-        - tensor: logits
-          stats: [min, max, mean]
-        - tensor: probs
-          stats: [min, max, mean, sparsity]
         - tensor: tokens
-          stats: [min, max, median, max_median_ratio, per_element%]
+          stats: [per_element%]
       freq: 10
       start_step: 1
 
@@ -43,7 +39,7 @@ mcore_io:
   megatron_core:
     LogMCoreTensorStats:
       enabled: True
-      tensors: [word, output, input, logits]
+      tensors: [output, input]
       stats: [min, max, mean]
       freq: 10
       start_step: 1

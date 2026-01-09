@@ -21,16 +21,45 @@ import torch
 from megatron.core.debug.debug_state import MCoreDebugState
 
 
+def get_reduction_params(
+    tensor_name: str,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Tuple[bool, Optional[torch.distributed.ProcessGroup], bool]:
+    """Get statistics reduction parameters for a tensor."""
+    import nvdlfw_inspect.api as debug_api
+
+    skip_reduction = False
+    reduction_group = debug_api.get_tensor_reduction_group()
+    reduce_within_microbatch = tensor_name.lower() != "weight"
+
+    if tensor_name.lower() == "weight":
+        if MCoreDebugState.weight_tensor_tp_group_reduce:
+            reduction_group = tp_group
+        else:
+            skip_reduction = True
+
+    return skip_reduction, reduction_group, reduce_within_microbatch
+
+
+def set_weight_tensor_tp_group_reduce(enabled: bool) -> None:
+    """Set whether weight tensor stats should be reduced across TP group."""
+    MCoreDebugState.set_weight_tensor_tp_group_reduce(enabled)
+
+
 class TensorInspectMixin:
+    """Mixin class for MCore modules that support tensor inspection."""
+
     _debug_name: Optional[str] = None
     _next_debug_iter: Optional[int] = 0
     _debug_last_iteration: Optional[int] = None
     _debug_enabled_this_iter: bool = False
 
     def _get_debug_name(self) -> str:
+        """Return the layer name for debug logging."""
         raise NotImplementedError
 
     def _get_reduction_group(self) -> Optional[torch.distributed.ProcessGroup]:
+        """Return the process group for weight tensor reduction (typically TP group)."""
         return None
 
     def _is_debug_iter(self) -> bool:
@@ -47,6 +76,7 @@ class TensorInspectMixin:
         return self._debug_enabled_this_iter
 
     def _inspect_tensor(self, tensor_name: str, tensor: torch.Tensor) -> None:
+        """Inspect a tensor and collect statistics."""
         if not self._is_debug_iter():
             return
         import nvdlfw_inspect.api as debug_api
@@ -69,12 +99,16 @@ class TensorInspectMixin:
             enabled = result
 
         if enabled:
+            skip_reduction, reduction_group, _ = get_reduction_params(
+                tensor_name, tp_group=self._get_reduction_group()
+            )
             debug_api.megatron_core.inspect_tensor(
                 layer_name=layer_name,
                 tensor_name=tensor_name,
                 tensor=tensor,
                 iteration=iteration,
-                reduction_group=self._get_reduction_group(),
+                reduction_group=reduction_group,
+                skip_reduction=skip_reduction,
             )
 
 

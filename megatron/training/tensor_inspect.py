@@ -144,7 +144,9 @@ def finalize_tensor_inspect_post_model(
     tensorboard_logger: Any = None,
     wandb_logger: Any = None,
     current_training_step: Optional[int] = None,
+    include_context_parallel: bool = False,
 ) -> None:
+    """Finalize tensor inspection after model is created."""
     if not enabled:
         return
 
@@ -159,7 +161,10 @@ def finalize_tensor_inspect_post_model(
         nvinspect_api.initialize_training_step(int(current_training_step))
 
     nvinspect_api.infer_and_assign_layer_names(model)
-    nvinspect_api.set_tensor_reduction_group(get_tensor_and_data_parallel_group())
+    reduction_group = get_tensor_and_data_parallel_group(
+        with_context_parallel=include_context_parallel
+    )
+    nvinspect_api.set_tensor_reduction_group(reduction_group)
     print_rank_0("Finalized NVIDIA DLFw Inspect.")
 
 
