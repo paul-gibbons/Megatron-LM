@@ -133,7 +133,9 @@ STATS = {
 }
 
 
+@torch.compile
 def _compute_dr_top(t: torch.Tensor) -> torch.Tensor:
+    """Compute log2 of the amax of the tensor."""
     abs_t = t.float().abs()
     nonzero = abs_t[abs_t > 0]
     if nonzero.numel() > 0:
@@ -141,7 +143,9 @@ def _compute_dr_top(t: torch.Tensor) -> torch.Tensor:
     return torch.tensor(0.0, device=t.device)
 
 
+@torch.compile
 def _compute_dr_bottom(t: torch.Tensor) -> torch.Tensor:
+    """Compute log2 of the amin of the tensor."""
     abs_t = t.float().abs()
     nonzero = abs_t[abs_t > 0]
     if nonzero.numel() > 0:
@@ -149,7 +153,9 @@ def _compute_dr_bottom(t: torch.Tensor) -> torch.Tensor:
     return torch.tensor(0.0, device=t.device)
 
 
+@torch.compile
 def _combine_variance(b: torch.Tensor) -> float:
+    """Welford algorithm for numerically stable distributed variance computation."""
     total_numel = _get(b, STAT_INDICES["numel"]).sum()
     total_sum = _get(b, STAT_INDICES["sum"]).sum()
     total_sum_sq = _get(b, STAT_INDICES["sum_sq"]).sum()

@@ -41,11 +41,6 @@ def get_reduction_params(
     return skip_reduction, reduction_group, reduce_within_microbatch
 
 
-def set_weight_tensor_tp_group_reduce(enabled: bool) -> None:
-    """Set whether weight tensor stats should be reduced across TP group."""
-    MCoreDebugState.set_weight_tensor_tp_group_reduce(enabled)
-
-
 class TensorInspectMixin:
     """Mixin class for MCore modules that support tensor inspection."""
 
@@ -110,15 +105,6 @@ class TensorInspectMixin:
                 reduction_group=reduction_group,
                 skip_reduction=skip_reduction,
             )
-
-
-def is_debug_enabled() -> bool:
-    MCoreDebugState.ensure_initialized()
-    return MCoreDebugState.debug_enabled or False
-
-
-def get_debug_iteration() -> int:
-    return MCoreDebugState.get_iteration()
 
 
 def compute_next_enabled_iter(

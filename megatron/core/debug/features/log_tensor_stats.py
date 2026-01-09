@@ -46,16 +46,16 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
             - num_zeros[threshold]: count of values where |x| < threshold
             - num_zeros[threshold]%: percentage of values where |x| < threshold
             Examples: num_zeros[1e-10], num_zeros[1e-20]%, num_zeros[1e-30]
-        - Quantiles: median, q1, q3, iqr, max_median_ratio (LOCAL ONLY - not reducible)
+        - Quantiles: median, max_median_ratio (LOCAL ONLY - not reducible)
         - Distribution: entropy, kurtosis (LOCAL ONLY - not reducible across ranks)
         - Per-element (SUMMED across micro-batches):
             - per_element: raw counts (expert0, expert1, ...)
             - per_element%: percentages (expert0%, expert1%, ...)
 
     Note on LOCAL ONLY stats:
-        Quantile stats (median, q1, q3, iqr, max_median_ratio), entropy, and kurtosis
-        are computed on the local tensor only and are NOT properly reducible across
-        distributed ranks. In distributed training, these stats represent local values.
+        Quantile stats (median, max_median_ratio), entropy, and kurtosis are computed
+        on the local tensor only and are NOT properly reducible across distributed
+        ranks. In distributed training, these stats represent local values.
 
     Config options:
         - stats: List of statistics to collect
@@ -80,7 +80,7 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
     """
 
     # Stats that cannot be properly reduced across distributed ranks
-    _NON_REDUCIBLE_STATS = {"median", "q1", "q3", "iqr", "max_median_ratio", "entropy", "kurtosis"}
+    _NON_REDUCIBLE_STATS = {"median", "max_median_ratio", "entropy", "kurtosis"}
 
     def __init__(self):
         super().__init__()
@@ -91,7 +91,7 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
         # Validation handles this separately in _validate_stats
         return {
             "min", "max", "mean", "std", "sum", "numel", "variance",
-            "median", "q1", "q3", "iqr", "max_median_ratio", "kurtosis",
+            "median", "max_median_ratio", "kurtosis",
             "l1_norm", "l2_norm", "cur_amax", "dynamic_range",
             "entropy", "per_element", "per_element%",
             "num_zeros", "num_zeros%",
