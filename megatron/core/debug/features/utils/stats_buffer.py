@@ -14,14 +14,44 @@
 
 """Stats buffer system for MCore tensor statistics."""
 
+import logging
 import math
+import re
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
 from nvdlfw_inspect.logging import MetricLogger
 from nvdlfw_inspect.utils import gather_along_first_dim
+
+logger = logging.getLogger(__name__)
+
+# Pattern to match num_zeros[threshold]% syntax
+# Groups: (1) threshold value (optional), (2) % suffix (optional)
+_NUM_ZEROS_PATTERN = re.compile(r'^num_zeros(?:\[([^\]]+)\])?(%)?$', re.IGNORECASE)
+
+
+def parse_num_zeros_stat(stat: str) -> Optional[Tuple[float, bool]]:
+    """Parse num_zeros stat with optional threshold and percentage.
+    
+    Syntax:
+        num_zeros        - count exact zeros
+        num_zeros%       - percentage of exact zeros
+        num_zeros[1e-10] - count values where |x| < 1e-10
+        num_zeros[1e-10]% - percentage of values where |x| < 1e-10
+    
+    Returns:
+        (threshold, is_percentage) tuple, or None if not a num_zeros stat.
+    """
+    match = _NUM_ZEROS_PATTERN.match(stat.strip())
+    if not match:
+        return None
+    
+    threshold_str, pct_suffix = match.groups()
+    threshold = float(threshold_str) if threshold_str else 0.0
+    is_percentage = pct_suffix is not None
+    return (threshold, is_percentage)
 
 
 STAT_INDICES = {
@@ -35,10 +65,9 @@ STAT_INDICES = {
     "cur_amax": 7,
     "dynamic_range_top": 8,
     "dynamic_range_bottom": 9,
-    "sparsity_zeros": 10,
 }
 
-NUM_BUFFER_STATS = 11
+NUM_BUFFER_STATS = 10
 
 
 STAT_DEPENDENCIES: Dict[str, Set[str]] = {
@@ -53,11 +82,11 @@ STAT_DEPENDENCIES: Dict[str, Set[str]] = {
     "l2_norm": {"l2_norm_sq"},
     "cur_amax": {"cur_amax"},
     "dynamic_range": {"dynamic_range_top", "dynamic_range_bottom"},
-    "sparsity": {"sparsity_zeros", "numel"},
 }
 
 
 def _compute_base_stats(tensor: torch.Tensor, stats_needed: Set[str]) -> Dict[str, torch.Tensor]:
+    """Compute base statistics from a tensor."""
     results = {}
     t_float = tensor.float()
 
@@ -69,12 +98,16 @@ def _compute_base_stats(tensor: torch.Tensor, stats_needed: Set[str]) -> Dict[st
         results["sum"] = t_float.sum()
     if "numel" in stats_needed:
         results["numel"] = torch.tensor(tensor.numel(), dtype=torch.float32, device=tensor.device)
-    if "sum_sq" in stats_needed:
-        results["sum_sq"] = (t_float ** 2).sum()
+
+    if "sum_sq" in stats_needed or "l2_norm_sq" in stats_needed:
+        sq_sum = (t_float ** 2).sum()
+        if "sum_sq" in stats_needed:
+            results["sum_sq"] = sq_sum
+        if "l2_norm_sq" in stats_needed:
+            results["l2_norm_sq"] = sq_sum
+
     if "l1_norm" in stats_needed:
         results["l1_norm"] = torch.norm(t_float, p=1)
-    if "l2_norm_sq" in stats_needed:
-        results["l2_norm_sq"] = (t_float ** 2).sum()
     if "cur_amax" in stats_needed:
         results["cur_amax"] = t_float.abs().max()
     if "dynamic_range_top" in stats_needed or "dynamic_range_bottom" in stats_needed:
@@ -86,8 +119,6 @@ def _compute_base_stats(tensor: torch.Tensor, stats_needed: Set[str]) -> Dict[st
         else:
             results["dynamic_range_top"] = torch.tensor(0.0, device=tensor.device)
             results["dynamic_range_bottom"] = torch.tensor(0.0, device=tensor.device)
-    if "sparsity_zeros" in stats_needed:
-        results["sparsity_zeros"] = (tensor == 0).sum().float()
     
     return results
 
@@ -131,10 +162,6 @@ def _combine_stats(buffers: torch.Tensor, stat_name: str) -> float:
         top = get("dynamic_range_top").max()
         bottom = get("dynamic_range_bottom").min()
         return (top - bottom).item()
-    elif stat_name == "sparsity":
-        total_zeros = get("sparsity_zeros").sum()
-        total_numel = get("numel").sum()
-        return (total_zeros / total_numel).item()
     else:
         raise ValueError(f"Unknown stat: {stat_name}")
 
@@ -169,6 +196,17 @@ class _MCoreStatsBuffer:
         self._per_element_values: Optional[torch.Tensor] = None
         self._per_element_accumulated: Optional[torch.Tensor] = None
         self._per_element_count: int = 0
+        
+        # Storage for num_zeros with different thresholds: {threshold: count}
+        self._num_zeros_counts: Dict[float, int] = {}
+        self._num_zeros_numel: int = 0
+        # Parse which thresholds we need to compute
+        self._num_zeros_thresholds: Dict[float, bool] = {}  # threshold -> is_percentage
+        for stat in stats_to_log:
+            parsed = parse_num_zeros_stat(stat)
+            if parsed:
+                threshold, is_pct = parsed
+                self._num_zeros_thresholds[threshold] = is_pct
 
     def _reset(self):
         self._buffer.zero_()
@@ -177,6 +215,8 @@ class _MCoreStatsBuffer:
         self._per_element_values = None
         self._per_element_accumulated = None
         self._per_element_count = 0
+        self._num_zeros_counts.clear()
+        self._num_zeros_numel = 0
 
     def feed(
         self,
@@ -211,7 +251,7 @@ class _MCoreStatsBuffer:
                     self._buffer[idx] = torch.min(old_val, new_val)
                 elif stat_name == "max":
                     self._buffer[idx] = torch.max(old_val, new_val)
-                elif stat_name in ("sum", "numel", "sum_sq", "l1_norm", "l2_norm_sq", "sparsity_zeros"):
+                elif stat_name in ("sum", "numel", "sum_sq", "l1_norm", "l2_norm_sq"):
                     self._buffer[idx] = old_val + new_val
                 elif stat_name == "cur_amax":
                     self._buffer[idx] = torch.max(old_val, new_val)
@@ -233,6 +273,12 @@ class _MCoreStatsBuffer:
                     self._per_element_accumulated += flat
                     self._per_element_count += 1
                 else:
+                    logger.warning(
+                        f"[MCore Debug] Per-element shape mismatch for "
+                        f"{self.layer_name}/{self.tensor_name}: "
+                        f"expected {self._per_element_accumulated.shape}, got {flat.shape}. "
+                        f"Resetting accumulator."
+                    )
                     self._per_element_accumulated = flat.clone()
                     self._per_element_count = 1
             elif stat_lower == "entropy":
@@ -242,6 +288,16 @@ class _MCoreStatsBuffer:
                     p = p / p.sum()
                 entropy = -(p * torch.log(p)).sum()
                 self._direct_stats["entropy"] = entropy.item()
+            elif stat_lower == "kurtosis":
+                flat = tensor.float().flatten()
+                mean = flat.mean()
+                std = flat.std()
+                if std > 1e-10:
+                    centered = flat - mean
+                    kurtosis = (centered ** 4).mean() / (std ** 4)
+                    self._direct_stats["kurtosis"] = kurtosis.item()
+                else:
+                    self._direct_stats["kurtosis"] = 0.0
             elif stat_lower in ("median", "q1", "q3", "iqr", "max_median_ratio"):
                 flat = tensor.float().flatten()
                 if stat_lower == "median":
@@ -261,6 +317,17 @@ class _MCoreStatsBuffer:
                         self._direct_stats["max_median_ratio"] = (max_val / median_val).item()
                     else:
                         self._direct_stats["max_median_ratio"] = float('inf')
+
+        # Compute num_zeros for each threshold
+        if self._num_zeros_thresholds:
+            abs_tensor = tensor.float().abs()
+            self._num_zeros_numel += tensor.numel()
+            for threshold in self._num_zeros_thresholds:
+                if threshold == 0.0:
+                    count = (tensor == 0).sum().item()
+                else:
+                    count = (abs_tensor < threshold).sum().item()
+                self._num_zeros_counts[threshold] = self._num_zeros_counts.get(threshold, 0) + count
 
         self.modified[0] = True
 
@@ -313,6 +380,34 @@ class _MCoreStatsBuffer:
                                 metric_name = f"{self.layer_name}_{self.tensor_name}_expert{idx}%"
                                 MetricLogger.log_scalar(metric_name, pct, self.iteration)
                                 output[(self.layer_name, self.tensor_name, f"expert_{idx}%", self.iteration)] = pct
+                continue
+
+            # Handle num_zeros[threshold]% stats
+            parsed = parse_num_zeros_stat(stat)
+            if parsed is not None:
+                threshold, is_percentage = parsed
+                count = self._num_zeros_counts.get(threshold, 0)
+                numel = self._num_zeros_numel
+                
+                # Format threshold for metric name
+                if threshold == 0.0:
+                    threshold_str = ""
+                else:
+                    threshold_str = f"[{threshold:g}]"
+                
+                if is_percentage:
+                    if numel > 0:
+                        value = (count / numel) * 100
+                    else:
+                        value = 0.0
+                    stat_name = f"num_zeros{threshold_str}%"
+                else:
+                    value = count
+                    stat_name = f"num_zeros{threshold_str}"
+                
+                metric_name = f"{self.layer_name}_{self.tensor_name}_{stat_name}"
+                MetricLogger.log_scalar(metric_name, value, self.iteration)
+                output[(self.layer_name, self.tensor_name, stat_name, self.iteration)] = value
                 continue
 
             if stat_lower in self._direct_stats:

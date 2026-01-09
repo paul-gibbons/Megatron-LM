@@ -39,12 +39,23 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
     Supported stats:
         - Basic: min, max, mean, std, sum, numel, variance
         - Norms: l1_norm, l2_norm, cur_amax
-        - Range: dynamic_range, sparsity
-        - Quantiles: median, q1, q3, iqr, max_median_ratio
-        - Distribution: entropy (detects "one-hot" routing when → 0)
+        - Range: dynamic_range
+        - Zero counting (useful for FTZ detection):
+            - num_zeros: count of exact zeros
+            - num_zeros%: percentage of exact zeros
+            - num_zeros[threshold]: count of values where |x| < threshold
+            - num_zeros[threshold]%: percentage of values where |x| < threshold
+            Examples: num_zeros[1e-10], num_zeros[1e-20]%, num_zeros[1e-30]
+        - Quantiles: median, q1, q3, iqr, max_median_ratio (LOCAL ONLY - not reducible)
+        - Distribution: entropy, kurtosis (LOCAL ONLY - not reducible across ranks)
         - Per-element (SUMMED across micro-batches):
             - per_element: raw counts (expert0, expert1, ...)
             - per_element%: percentages (expert0%, expert1%, ...)
+
+    Note on LOCAL ONLY stats:
+        Quantile stats (median, q1, q3, iqr, max_median_ratio), entropy, and kurtosis
+        are computed on the local tensor only and are NOT properly reducible across
+        distributed ranks. In distributed training, these stats represent local values.
 
     Config options:
         - stats: List of statistics to collect
@@ -68,21 +79,25 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
               end_step: 10000
     """
 
+    # Stats that cannot be properly reduced across distributed ranks
+    _NON_REDUCIBLE_STATS = {"median", "q1", "q3", "iqr", "max_median_ratio", "entropy", "kurtosis"}
+
     def __init__(self):
         super().__init__()
+        self._warned_non_reducible = False
 
     def _get_supported_stats_list(self) -> set:
+        # Note: num_zeros supports parameterized syntax: num_zeros[threshold]%
+        # Validation handles this separately in _validate_stats
         return {
             "min", "max", "mean", "std", "sum", "numel", "variance",
-            "median", "q1", "q3", "iqr", "max_median_ratio",
-            "l1_norm", "l2_norm", "cur_amax", "dynamic_range", "sparsity",
+            "median", "q1", "q3", "iqr", "max_median_ratio", "kurtosis",
+            "l1_norm", "l2_norm", "cur_amax", "dynamic_range",
             "entropy", "per_element", "per_element%",
+            "num_zeros", "num_zeros%",
         }
 
-    def _check_log_frequency(
-        self, config: Dict, iteration: int
-    ) -> Tuple[bool, Optional[int]]:
-        """Check if current iteration should log and compute next enabled iter."""
+    def _check_log_frequency(self, config: Dict, iteration: int) -> Tuple[bool, Optional[int]]:
         freq = config.get("freq", 1)
         start_step = config.get("start_step", 0)
         end_step = config.get("end_step", -1)
@@ -117,6 +132,40 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
 
         return should_run, next_iter
 
+    def _validate_stats(self, stats: list) -> None:
+        """Validate that all requested stats are supported."""
+        from megatron.core.debug.features.utils.stats_buffer import parse_num_zeros_stat
+        
+        supported = self._get_supported_stats_list()
+        for stat in stats:
+            # Check if it's a parameterized num_zeros stat
+            if parse_num_zeros_stat(stat) is not None:
+                continue
+            if stat.lower() not in supported:
+                raise ValueError(
+                    f"[MCore Debug] Unsupported stat: '{stat}'. "
+                    f"Supported stats: {sorted(supported)} "
+                    f"(also supports num_zeros[threshold] and num_zeros[threshold]%)"
+                )
+
+    def _warn_non_reducible_stats(self, stats: list) -> None:
+        """Warn once if non-reducible stats are used in distributed context."""
+        if self._warned_non_reducible:
+            return
+        
+        non_reducible_used = [
+            s for s in stats if s.lower() in self._NON_REDUCIBLE_STATS
+        ]
+        if non_reducible_used:
+            debug_api.log_message(
+                f"[MCore Debug] Warning: Stats {non_reducible_used} are computed locally "
+                f"and cannot be properly reduced across distributed ranks. "
+                f"Values represent local approximations only.",
+                layer_name="",
+                level=logging.WARNING,
+            )
+            self._warned_non_reducible = True
+
     @api_method
     def inspect_tensor(
         self,
@@ -132,14 +181,18 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
         if not should_run:
             return
 
+        stats_to_collect = config.get("stats", ["min", "max", "mean"])
+        
+        # Validate stats
+        self._validate_stats(stats_to_collect)
+        self._warn_non_reducible_stats(stats_to_collect)
+
         debug_api.log_message(
             f"Feature={self.__class__.__name__}, API=inspect_tensor: "
             f"layer={layer_name}, tensor={tensor_name}, shape={tensor.shape}",
             layer_name=layer_name,
             level=logging.INFO,
         )
-
-        stats_to_collect = config.get("stats", ["min", "max", "mean"])
         reduction_group = kwargs.get("reduction_group", None)
         skip_reduction = kwargs.get("skip_reduction", False)
 
