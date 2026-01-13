@@ -17,7 +17,7 @@
 import logging
 import re
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -31,6 +31,26 @@ from megatron.core.debug.features.utils.optimizer_stats_computation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _synchronize_param_names(
+    local_names: Set[str],
+    reduction_group: Optional[torch.distributed.ProcessGroup],
+) -> List[str]:
+    """Gather and sort parameter names across all ranks for synchronized collective ops."""
+    if reduction_group is None or not torch.distributed.is_initialized():
+        return sorted(local_names)
+
+    world_size = torch.distributed.get_world_size(group=reduction_group)
+    gathered_names = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered_names, local_names, group=reduction_group)
+
+    all_names: Set[str] = set()
+    for names in gathered_names:
+        if names:
+            all_names.update(names)
+
+    return sorted(all_names)
 
 
 def extract_layer_key(param_name: str, aggregate_by: str) -> Optional[str]:
@@ -168,6 +188,78 @@ class _OptimizerStatsBuffer:
         self._reset()
         return output
 
+    def log_synchronized(
+        self,
+        reduction_group: Optional[torch.distributed.ProcessGroup],
+    ) -> Dict[Tuple, float]:
+        """Log stats with synchronized all_reduce (all ranks participate even if unmodified)."""
+        output = {}
+        name_prefix = (
+            extract_layer_key(self.param_name, self.aggregate_by)
+            if self.aggregate_by
+            else self.param_name
+        )
+
+        if self.modified[0]:
+            buffer_to_reduce = self._buffer.clone()
+        else:
+            buffer_to_reduce = torch.zeros(NUM_BUFFER_STATS, dtype=torch.float64, device="cuda")
+
+        if reduction_group is not None:
+            torch.distributed.all_reduce(
+                buffer_to_reduce, op=torch.distributed.ReduceOp.SUM, group=reduction_group
+            )
+
+        thresholds = sorted(self._num_zeros_thresholds)
+        reduced_num_zeros: Dict[float, float] = {}
+        reduced_numel = 0
+
+        if thresholds:
+            data = torch.zeros(len(thresholds) + 1, dtype=torch.float64, device="cuda")
+            if self.modified[0]:
+                for i, t in enumerate(thresholds):
+                    data[i] = self._num_zeros.get(t, 0)
+                data[-1] = self._num_zeros_numel
+
+            if reduction_group is not None:
+                torch.distributed.all_reduce(
+                    data, op=torch.distributed.ReduceOp.SUM, group=reduction_group
+                )
+
+            reduced_num_zeros = {t: data[i].item() for i, t in enumerate(thresholds)}
+            reduced_numel = int(data[-1].item())
+        elif self.modified[0]:
+            reduced_numel = self._num_zeros_numel
+
+        has_data = buffer_to_reduce.abs().sum() > 0 or reduced_numel > 0
+
+        if has_data and self.iteration is not None:
+            from megatron.core.debug.features.utils.stats_computation import parse_num_zeros_stat
+            for stat in self.stats:
+                parsed = parse_num_zeros_stat(stat)
+                if parsed:
+                    threshold, is_pct = parsed
+                    count = reduced_num_zeros.get(threshold, 0)
+                    threshold_str = "" if threshold == 0.0 else f"[{threshold:g}]"
+                    if is_pct:
+                        value = 100.0 * count / reduced_numel if reduced_numel > 0 else 0.0
+                        stat_name = f"num_zeros{threshold_str}%"
+                    else:
+                        value = count
+                        stat_name = f"num_zeros{threshold_str}"
+                    metric_name = f"optimizer_{name_prefix}_{stat_name}"
+                    MetricLogger.log_scalar(metric_name, value, self.iteration)
+                    output[(name_prefix, stat_name, self.iteration)] = value
+
+            final = compute_final_stats(buffer_to_reduce, self.stats)
+            for stat_name, value in final.items():
+                metric_name = f"optimizer_{name_prefix}_{stat_name}"
+                MetricLogger.log_scalar(metric_name, value, self.iteration)
+                output[(name_prefix, stat_name, self.iteration)] = value
+
+        self._reset()
+        return output
+
     def get_num_zeros_data(self) -> Tuple[Dict[float, float], int]:
         return self._num_zeros.copy(), self._num_zeros_numel
 
@@ -217,83 +309,134 @@ class OptimizerStatsBuffers:
         if self.aggregate_by:
             return self._log_aggregated(current_iter)
 
-        output = {}
+        reduction_group = None
         for buffers in self.reduction_group_to_buffers.values():
-            for buffer in buffers:
-                if buffer.modified[0]:
-                    output.update(buffer.log())
+            if buffers:
+                reduction_group = buffers[0].reduction_group
+                break
+
+        local_names = set(self.buffers.keys())
+        all_param_names = _synchronize_param_names(local_names, reduction_group)
+
+        output = {}
+        for param_name in all_param_names:
+            if param_name in self.buffers:
+                buffer = self.buffers[param_name]
+                output.update(buffer.log_synchronized(reduction_group))
+            elif reduction_group is not None:
+                self._participate_in_reduction_only(param_name, reduction_group)
+
         self.at_least_one_fed = False
         return output
+
+    def _participate_in_reduction_only(
+        self,
+        param_name: str,
+        reduction_group: torch.distributed.ProcessGroup,
+    ) -> None:
+        """Participate in all_reduce with zeros for a parameter this rank doesn't have."""
+        sample_buffer = next(iter(self.buffers.values()), None)
+        if sample_buffer is None:
+            return
+
+        zero_buffer = torch.zeros(NUM_BUFFER_STATS, dtype=torch.float64, device="cuda")
+        torch.distributed.all_reduce(
+            zero_buffer, op=torch.distributed.ReduceOp.SUM, group=reduction_group
+        )
+
+        thresholds = sorted(sample_buffer._num_zeros_thresholds)
+        if thresholds:
+            zero_data = torch.zeros(len(thresholds) + 1, dtype=torch.float64, device="cuda")
+            torch.distributed.all_reduce(
+                zero_data, op=torch.distributed.ReduceOp.SUM, group=reduction_group
+            )
 
     def _log_aggregated(self, current_iter: int) -> Dict[Tuple, float]:
         from megatron.core.debug.features.utils.stats_computation import parse_num_zeros_stat
 
-        grouped: Dict[str, List[_OptimizerStatsBuffer]] = defaultdict(list)
         reduction_group = None
         for buffer in self.buffers.values():
-            if buffer.modified[0]:
-                key = extract_layer_key(buffer.param_name, self.aggregate_by) or "unknown"
-                grouped[key].append(buffer)
-                reduction_group = buffer.reduction_group
+            reduction_group = buffer.reduction_group
+            break
+
+        local_grouped: Dict[str, List[_OptimizerStatsBuffer]] = defaultdict(list)
+        for buffer in self.buffers.values():
+            key = extract_layer_key(buffer.param_name, self.aggregate_by) or "unknown"
+            local_grouped[key].append(buffer)
+
+        local_layer_keys = set(local_grouped.keys())
+        all_layer_keys = _synchronize_param_names(local_layer_keys, reduction_group)
+
+        stats = None
+        iteration = current_iter
+        all_thresholds: Set[float] = set()
+        for buffer in self.buffers.values():
+            stats = buffer.stats
+            iteration = buffer.iteration if buffer.iteration is not None else iteration
+            all_thresholds.update(buffer._num_zeros_thresholds)
+
+        if stats is None:
+            self.at_least_one_fed = False
+            return {}
 
         output = {}
-        for layer_key, buffers in grouped.items():
+        for layer_key in all_layer_keys:
             combined = torch.zeros(NUM_BUFFER_STATS, dtype=torch.float64, device="cuda")
             combined_num_zeros: Dict[float, float] = {}
             combined_num_zeros_numel = 0
-            stats = None
-            iteration = None
-            all_thresholds = set()
 
-            for buffer in buffers:
-                combined += buffer._buffer
-                nz_dict, nz_numel = buffer.get_num_zeros_data()
-                for threshold, count in nz_dict.items():
-                    combined_num_zeros[threshold] = combined_num_zeros.get(threshold, 0) + count
-                combined_num_zeros_numel += nz_numel
-                all_thresholds.update(buffer._num_zeros_thresholds)
-                stats = buffer.stats
-                iteration = buffer.iteration
-                buffer._reset()
+            if layer_key in local_grouped:
+                for buffer in local_grouped[layer_key]:
+                    if buffer.modified[0]:
+                        combined += buffer._buffer
+                        nz_dict, nz_numel = buffer.get_num_zeros_data()
+                        for threshold, count in nz_dict.items():
+                            combined_num_zeros[threshold] = combined_num_zeros.get(threshold, 0) + count
+                        combined_num_zeros_numel += nz_numel
+                    buffer._reset()
 
-            if stats and iteration is not None:
-                if reduction_group is not None:
+            if reduction_group is not None:
+                torch.distributed.all_reduce(
+                    combined, op=torch.distributed.ReduceOp.SUM, group=reduction_group
+                )
+
+                thresholds = sorted(all_thresholds)
+                if thresholds:
+                    data = torch.zeros(len(thresholds) + 1, dtype=torch.float64, device="cuda")
+                    for i, t in enumerate(thresholds):
+                        data[i] = combined_num_zeros.get(t, 0)
+                    data[-1] = combined_num_zeros_numel
                     torch.distributed.all_reduce(
-                        combined, op=torch.distributed.ReduceOp.SUM, group=reduction_group
+                        data, op=torch.distributed.ReduceOp.SUM, group=reduction_group
                     )
-                    thresholds = sorted(all_thresholds)
-                    if thresholds:
-                        data = torch.zeros(len(thresholds) + 1, dtype=torch.float64, device="cuda")
-                        for i, t in enumerate(thresholds):
-                            data[i] = combined_num_zeros.get(t, 0)
-                        data[-1] = combined_num_zeros_numel
-                        torch.distributed.all_reduce(
-                            data, op=torch.distributed.ReduceOp.SUM, group=reduction_group
-                        )
-                        combined_num_zeros = {t: data[i].item() for i, t in enumerate(thresholds)}
-                        combined_num_zeros_numel = int(data[-1].item())
+                    combined_num_zeros = {t: data[i].item() for i, t in enumerate(thresholds)}
+                    combined_num_zeros_numel = int(data[-1].item())
 
-                for stat in stats:
-                    parsed = parse_num_zeros_stat(stat)
-                    if parsed:
-                        threshold, is_pct = parsed
-                        count = combined_num_zeros.get(threshold, 0)
-                        threshold_str = "" if threshold == 0.0 else f"[{threshold:g}]"
-                        if is_pct:
-                            value = 100.0 * count / combined_num_zeros_numel if combined_num_zeros_numel > 0 else 0.0
-                            stat_name = f"num_zeros{threshold_str}%"
-                        else:
-                            value = count
-                            stat_name = f"num_zeros{threshold_str}"
-                        metric_name = f"optimizer_{layer_key}_{stat_name}"
-                        MetricLogger.log_scalar(metric_name, value, iteration)
-                        output[(layer_key, stat_name, iteration)] = value
+            has_data = combined.abs().sum() > 0 or combined_num_zeros_numel > 0
+            if not has_data:
+                continue
 
-                final = compute_final_stats(combined, stats)
-                for stat_name, value in final.items():
+            for stat in stats:
+                parsed = parse_num_zeros_stat(stat)
+                if parsed:
+                    threshold, is_pct = parsed
+                    count = combined_num_zeros.get(threshold, 0)
+                    threshold_str = "" if threshold == 0.0 else f"[{threshold:g}]"
+                    if is_pct:
+                        value = 100.0 * count / combined_num_zeros_numel if combined_num_zeros_numel > 0 else 0.0
+                        stat_name = f"num_zeros{threshold_str}%"
+                    else:
+                        value = count
+                        stat_name = f"num_zeros{threshold_str}"
                     metric_name = f"optimizer_{layer_key}_{stat_name}"
                     MetricLogger.log_scalar(metric_name, value, iteration)
                     output[(layer_key, stat_name, iteration)] = value
+
+            final = compute_final_stats(combined, stats)
+            for stat_name, value in final.items():
+                metric_name = f"optimizer_{layer_key}_{stat_name}"
+                MetricLogger.log_scalar(metric_name, value, iteration)
+                output[(layer_key, stat_name, iteration)] = value
 
         self.at_least_one_fed = False
         return output
