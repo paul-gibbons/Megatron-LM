@@ -81,10 +81,10 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
 
     # Stats that cannot be properly reduced across distributed ranks
     _NON_REDUCIBLE_STATS = {"median", "max_median_ratio", "entropy", "kurtosis"}
+    _warned_non_reducible = False
 
     def __init__(self):
         super().__init__()
-        self._warned_non_reducible = False
 
     def _get_supported_stats_list(self) -> set:
         # Note: num_zeros supports parameterized syntax: num_zeros[threshold]%
@@ -150,21 +150,21 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
 
     def _warn_non_reducible_stats(self, stats: list) -> None:
         """Warn once if non-reducible stats are used in distributed context."""
-        if self._warned_non_reducible:
+        if LogMCoreTensorStats._warned_non_reducible:
             return
-        
+
         non_reducible_used = [
             s for s in stats if s.lower() in self._NON_REDUCIBLE_STATS
         ]
         if non_reducible_used:
-            debug_api.log_message(
-                f"[MCore Debug] Warning: Stats {non_reducible_used} are computed locally "
-                f"and cannot be properly reduced across distributed ranks. "
-                f"Values represent local approximations only.",
-                layer_name="",
-                level=logging.WARNING,
-            )
-            self._warned_non_reducible = True
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                debug_api.log_message(
+                    f"[MCore Debug] Stats {non_reducible_used} are local-only (not reduced across ranks).",
+                    layer_name="",
+                    level=logging.WARNING,
+                )
+            LogMCoreTensorStats._warned_non_reducible = True
 
     @api_method
     def inspect_tensor(

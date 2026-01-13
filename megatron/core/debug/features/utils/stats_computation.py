@@ -159,6 +159,7 @@ DIRECT_STATS = {
 }
 
 
+@torch.no_grad()
 def _compute_entropy(t: torch.Tensor) -> float:
     p = t.float().flatten().clamp(min=1e-10)
     if p.sum() > 0:
@@ -166,6 +167,7 @@ def _compute_entropy(t: torch.Tensor) -> float:
     return -(p * torch.log(p)).sum().item()
 
 
+@torch.no_grad()
 def _compute_kurtosis(t: torch.Tensor) -> float:
     flat = t.float().flatten()
     std = flat.std()
@@ -174,6 +176,7 @@ def _compute_kurtosis(t: torch.Tensor) -> float:
     return 0.0
 
 
+@torch.no_grad()
 def _compute_max_median_ratio(t: torch.Tensor) -> float:
     flat = t.float().flatten()
     median = flat.median()
