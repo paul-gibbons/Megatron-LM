@@ -131,8 +131,9 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel) to params.
+    # Map (pg_overrides, is_expert_parallel) to params and names.
     params_map = {}
+    params_names_map = {}
 
     if config_overrides is None:
         # TODO remove this default behavior eventually.
@@ -171,7 +172,11 @@ def _get_param_groups(
             key = (param_override_tuple, is_expert_parallel)
             if key not in params_map:
                 params_map[key] = []
+                params_names_map[key] = []
             params_map[key].append(param)
+            # Get globally unique parameter name for optimizer stats logging
+            global_name = get_global_unique_param_name(model_chunks, param)
+            params_names_map[key].append(global_name)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -189,6 +194,7 @@ def _get_param_groups(
     for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
         param_override_tuple, is_expert_parallel = key
         params = params_map[key] if key in params_map else []
+        names = params_names_map[key] if key in params_names_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
         else:
@@ -219,6 +225,7 @@ def _get_param_groups(
         ), "'params' should not be in param_override, this is a protected key"
         param_group = {
             'params': params,
+            'names': names,  # Parameter names for optimizer stats logging
             'is_expert_parallel': is_expert_parallel,
             'default_config': uses_default_lr_schedule,
             **default_config,
@@ -471,6 +478,10 @@ def _get_megatron_optimizer_based_on_param_groups(
         tp_group = pg_collection.tp
     # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
     setattr(optimizer, 'tp_group', tp_group)
+
+    # Store param names for optimizer stats logging
+    if param_groups:
+        optimizer.set_param_names(param_groups)
 
     return optimizer
 

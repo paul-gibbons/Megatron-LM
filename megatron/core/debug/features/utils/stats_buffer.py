@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stats buffer system for MCore tensor statistics."""
+"""Stats buffer for MCore tensor statistics."""
 
 import logging
 from collections import defaultdict
@@ -55,6 +55,7 @@ class _MCoreStatsBuffer:
                 self.stats_to_compute.update(STAT_DEPENDENCIES[stat_lower])
 
         self._buffer = torch.zeros(NUM_BUFFER_STATS, dtype=torch.float32, device="cuda")
+        self._tmp_buffer = self._buffer.clone()
         self.modified = torch.tensor([False], dtype=torch.bool, device="cuda")
         self.iteration: Optional[int] = None
         self.skip_reduction = False
@@ -86,17 +87,24 @@ class _MCoreStatsBuffer:
         if tensor.numel() == 0:
             return
 
+        # Compute stats into tmp buffer
         for stat_name in self.stats_to_compute:
             if stat_name not in STAT_INDICES:
                 continue
-            idx = STAT_INDICES[stat_name]
-            compute_fn, _, accum_fn = STATS[stat_name]
-            new_val = compute_fn(tensor)
-            
-            if self.modified[0] and accum_fn:
-                self._buffer[idx] = accum_fn(self._buffer[idx], new_val)
-            else:
-                self._buffer[idx] = new_val
+            compute_fn, _ = STATS[stat_name]
+            self._tmp_buffer[STAT_INDICES[stat_name]] = compute_fn(tensor)
+
+        # Accumulate using combinator (same pattern as TE)
+        # Stack [old_buffer, new_buffer] and apply combinator
+        if self.modified[0]:
+            buffers = torch.stack([self._buffer, self._tmp_buffer], dim=0)
+            for stat_name in self.stats_to_compute:
+                if stat_name not in STAT_INDICES:
+                    continue
+                _, combinator = STATS[stat_name]
+                self._buffer[STAT_INDICES[stat_name]] = combinator(buffers)
+        else:
+            self._buffer.copy_(self._tmp_buffer)
 
         for stat in self.stats_to_log:
             stat_lower = stat.lower()
@@ -109,7 +117,7 @@ class _MCoreStatsBuffer:
                 elif self._per_element_acc.shape == flat.shape:
                     self._per_element_acc += flat
                 else:
-                    logger.warning(f"[MCore] Per-element shape mismatch, resetting")
+                    logger.warning("[MCore] Per-element shape mismatch, resetting")
                     self._per_element_acc = flat.clone()
 
         if self._num_zeros_thresholds:
@@ -152,9 +160,12 @@ class _MCoreStatsBuffer:
             if stat_lower in self._direct_stats:
                 value = self._direct_stats[stat_lower]
             elif stat_lower in STATS:
-                _, combine_fn, _ = STATS[stat_lower]
+                _, combine_fn = STATS[stat_lower]
                 if combine_fn:
                     value = combine_fn(gathered)
+                    # Convert tensor to Python float for logging
+                    if hasattr(value, 'item'):
+                        value = value.item()
 
             if value is not None:
                 metric_name = f"{self.layer_name}_{self.tensor_name}_{stat_lower}"
@@ -167,7 +178,7 @@ class _MCoreStatsBuffer:
     def _log_per_element(self, stat_lower: str, output: dict):
         if self._per_element_acc is None:
             return
-        
+
         if not self.skip_reduction and self.reduction_group is not None:
             gathered, _ = gather_along_first_dim(
                 self._per_element_acc.unsqueeze(0), process_group=self.reduction_group
@@ -191,7 +202,7 @@ class _MCoreStatsBuffer:
     def _log_num_zeros(self, stat: str, parsed: Tuple[float, bool], output: dict):
         threshold, is_pct = parsed
         count = self._num_zeros.get(threshold, 0)
-        
+
         threshold_str = "" if threshold == 0.0 else f"[{threshold:g}]"
         if is_pct:
             value = (count / self._num_zeros_numel * 100) if self._num_zeros_numel > 0 else 0.0

@@ -53,89 +53,79 @@ STAT_DEPENDENCIES: Dict[str, Set[str]] = {
     "dynamic_range": {"dynamic_range_top", "dynamic_range_bottom"},
 }
 
+# STATS: (compute_fn, combinator)
+# - compute_fn: tensor -> scalar tensor for buffer
+# - combinator: [N, num_stats] buffer tensor -> combined value (tensor or scalar)
+# The combinator handles BOTH micro-batch accumulation AND cross-rank reduction
+# (same pattern as TransformerEngine)
 STATS = {
     "min": (
         lambda t: t.float().min(),
-        lambda b: _get(b, STAT_INDICES["min"]).min().item(),
-        lambda old, new: torch.min(old, new),
+        lambda b: _get(b, STAT_INDICES["min"]).min(),
     ),
     "max": (
         lambda t: t.float().max(),
-        lambda b: _get(b, STAT_INDICES["max"]).max().item(),
-        lambda old, new: torch.max(old, new),
+        lambda b: _get(b, STAT_INDICES["max"]).max(),
     ),
     "sum": (
         lambda t: t.float().sum(),
-        lambda b: _get(b, STAT_INDICES["sum"]).sum().item(),
-        lambda old, new: old + new,
+        lambda b: _get(b, STAT_INDICES["sum"]).sum(),
     ),
     "numel": (
-        lambda t: torch.tensor(t.numel(), dtype=torch.float32, device=t.device),
-        lambda b: _get(b, STAT_INDICES["numel"]).sum().item(),
-        lambda old, new: old + new,
+        lambda t: torch.tensor(float(t.numel()), device=t.device),
+        lambda b: _get(b, STAT_INDICES["numel"]).sum(),
     ),
     "sum_sq": (
         lambda t: (t.float() ** 2).sum(),
-        lambda b: _get(b, STAT_INDICES["sum_sq"]).sum().item(),
-        lambda old, new: old + new,
+        lambda b: _get(b, STAT_INDICES["sum_sq"]).sum(),
     ),
     "l1_norm": (
         lambda t: t.float().abs().sum(),
-        lambda b: _get(b, STAT_INDICES["l1_norm"]).sum().item(),
-        lambda old, new: old + new,
+        lambda b: _get(b, STAT_INDICES["l1_norm"]).sum(),
     ),
     "l2_norm_sq": (
         lambda t: (t.float() ** 2).sum(),
-        lambda b: _get(b, STAT_INDICES["l2_norm_sq"]).sum().item(),
-        lambda old, new: old + new,
+        lambda b: _get(b, STAT_INDICES["l2_norm_sq"]).sum(),
     ),
     "cur_amax": (
         lambda t: t.float().abs().max(),
-        lambda b: _get(b, STAT_INDICES["cur_amax"]).max().item(),
-        lambda old, new: torch.max(old, new),
+        lambda b: _get(b, STAT_INDICES["cur_amax"]).max(),
     ),
     "dynamic_range_top": (
         lambda t: _compute_dr_top(t),
-        lambda b: _get(b, STAT_INDICES["dynamic_range_top"]).max().item(),
-        lambda old, new: torch.max(old, new),
+        lambda b: _get(b, STAT_INDICES["dynamic_range_top"]).max(),
     ),
     "dynamic_range_bottom": (
         lambda t: _compute_dr_bottom(t),
-        lambda b: _get(b, STAT_INDICES["dynamic_range_bottom"]).min().item(),
-        lambda old, new: torch.min(old, new),
+        lambda b: _get(b, STAT_INDICES["dynamic_range_bottom"]).min(),
     ),
+    # Derived stats (no compute_fn, only combinator for final value)
     "mean": (
         None,
-        lambda b: (_get(b, STAT_INDICES["sum"]).sum() / _get(b, STAT_INDICES["numel"]).sum()).item(),
-        None,
+        lambda b: _get(b, STAT_INDICES["sum"]).sum() / _get(b, STAT_INDICES["numel"]).sum(),
     ),
     "variance": (
         None,
         lambda b: _combine_variance(b),
-        None,
     ),
     "std": (
         None,
         lambda b: math.sqrt(max(0, _combine_variance(b))),
-        None,
     ),
     "l2_norm": (
         None,
-        lambda b: math.sqrt(_get(b, STAT_INDICES["l2_norm_sq"]).sum().item()),
-        None,
+        lambda b: math.sqrt(float(_get(b, STAT_INDICES["l2_norm_sq"]).sum())),
     ),
     "dynamic_range": (
         None,
-        lambda b: (_get(b, STAT_INDICES["dynamic_range_top"]).max() - 
-                   _get(b, STAT_INDICES["dynamic_range_bottom"]).min()).item(),
-        None,
+        lambda b: _get(b, STAT_INDICES["dynamic_range_top"]).max() -
+                  _get(b, STAT_INDICES["dynamic_range_bottom"]).min(),
     ),
 }
 
 
 @torch.compile
 def _compute_dr_top(t: torch.Tensor) -> torch.Tensor:
-    """Compute log2 of the amax of the tensor."""
     abs_t = t.float().abs()
     nonzero = abs_t[abs_t > 0]
     if nonzero.numel() > 0:
@@ -145,7 +135,6 @@ def _compute_dr_top(t: torch.Tensor) -> torch.Tensor:
 
 @torch.compile
 def _compute_dr_bottom(t: torch.Tensor) -> torch.Tensor:
-    """Compute log2 of the amin of the tensor."""
     abs_t = t.float().abs()
     nonzero = abs_t[abs_t > 0]
     if nonzero.numel() > 0:
@@ -155,7 +144,6 @@ def _compute_dr_bottom(t: torch.Tensor) -> torch.Tensor:
 
 @torch.compile
 def _combine_variance(b: torch.Tensor) -> float:
-    """Welford algorithm for numerically stable distributed variance computation."""
     total_numel = _get(b, STAT_INDICES["numel"]).sum()
     total_sum = _get(b, STAT_INDICES["sum"]).sum()
     total_sum_sq = _get(b, STAT_INDICES["sum_sq"]).sum()
@@ -192,4 +180,3 @@ def _compute_max_median_ratio(t: torch.Tensor) -> float:
     if median != 0:
         return (flat.max() / median).item()
     return float('inf')
-

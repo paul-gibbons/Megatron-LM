@@ -24,6 +24,7 @@ from nvdlfw_inspect.registry import Registry
 
 from megatron.core.debug.debug_state import MCoreDebugState
 from megatron.core.debug.features.utils.stats_buffer import MCORE_STATS_BUFFERS
+from megatron.core.debug.features.utils.optimizer_stats_buffer import OPTIMIZER_STATS_BUFFERS
 
 
 class MCoreConfigAPIMapper(BaseConfigAPIMapper):
@@ -34,11 +35,14 @@ class MCoreConfigAPIMapper(BaseConfigAPIMapper):
         processed_config = None
         config_copy = copy.deepcopy(config)
         tensor_parsing = kwargs.get("tensor_parsing", False)
+        param_parsing = kwargs.get("param_parsing", False)
 
         if tensor_parsing:
             processed_config = self._process_tensor_config(
                 config_copy, kwargs["tensor_name"]
             )
+        elif param_parsing:
+            processed_config = config_copy
 
         if not processed_config:
             return False, None
@@ -72,10 +76,31 @@ class MCoreDefaultFeatures:
     ) -> None:
         pass
 
+    def inspect_optimizer_param_enabled(
+        self,
+        config: Dict,
+        layer_name: str,
+        iteration: int,
+        **kwargs,
+    ) -> Tuple[bool, Optional[int]]:
+        return False, None
+
+    def inspect_optimizer_param(
+        self,
+        config: Dict,
+        layer_name: str,
+        param: torch.Tensor,
+        iteration: int,
+        **kwargs,
+    ) -> None:
+        pass
+
 
 required_kwargs = {
     "inspect_tensor": ["tensor_name"],
     "inspect_tensor_enabled": ["tensor_name"],
+    "inspect_optimizer_param": ["param_name"],
+    "inspect_optimizer_param_enabled": ["param_name"],
 }
 
 
@@ -89,10 +114,17 @@ class MegatronCoreAPI(BaseNamespaceAPI):
         self._cacheable_api_kwargs_map = {
             "inspect_tensor": ["tensor_name"],
             "inspect_tensor_enabled": ["tensor_name", "iteration"],
+            "inspect_optimizer_param": ["param_name"],
+            "inspect_optimizer_param_enabled": ["param_name", "iteration"],
         }
 
     def is_multiple_feature_invocation_allowed(self, api_name):
-        return api_name in {"inspect_tensor", "inspect_tensor_enabled"}
+        return api_name in {
+            "inspect_tensor",
+            "inspect_tensor_enabled",
+            "inspect_optimizer_param",
+            "inspect_optimizer_param_enabled",
+        }
 
     def input_assertions_hook(self, api_name, **kwargs):
         if api_name in required_kwargs:
@@ -103,15 +135,16 @@ class MegatronCoreAPI(BaseNamespaceAPI):
 
     def routing_condition(self, api_name, config, layer_name, feature_obj, **kwargs):
         tensor_parsing = "tensor_name" in required_kwargs.get(api_name, [])
+        param_parsing = "param_name" in required_kwargs.get(api_name, [])
         status, modified_config = feature_obj.parse_config_and_api(
-            config, tensor_parsing=tensor_parsing, **kwargs
+            config, tensor_parsing=tensor_parsing, param_parsing=param_parsing, **kwargs
         )
         return status, modified_config
 
     def output_assertions_hook(self, api_name, ret, **kwargs):
         if "enabled" in api_name:
             assert isinstance(ret, (bool, tuple))
-        if api_name == "inspect_tensor":
+        if api_name in ("inspect_tensor", "inspect_optimizer_param"):
             assert ret is None
 
     def handle_multi_feature_output(
@@ -139,8 +172,10 @@ class MegatronCoreAPI(BaseNamespaceAPI):
     def step(self):
         current_iter = MCoreDebugState.get_iteration()
         MCORE_STATS_BUFFERS.log_stats(current_iter)
+        OPTIMIZER_STATS_BUFFERS.log_stats(current_iter)
 
     def end_debug(self):
         MCORE_STATS_BUFFERS.reset()
+        OPTIMIZER_STATS_BUFFERS.reset()
         MCoreDebugState._reset()
 

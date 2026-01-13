@@ -297,6 +297,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for group_index, group_range in enumerate(group_ranges):
             group_range["orig_group"] = param_groups[group_index]
             group_range["orig_group_idx"] = param_groups[group_index]
+            if "names" in param_groups[group_index]:
+                group_range["orig_group"]["_orig_params_for_names"] = list(
+                    param_groups[group_index]["params"]
+                )
+                group_range["orig_group"]["_orig_names"] = list(
+                    param_groups[group_index]["names"]
+                )
 
         return local_param_group_map, group_ranges
 
@@ -444,6 +451,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     *shard_fp32_params_this_group,
                     *shard_float16_params_this_group,
                 ]
+
+            # Update names to match the new params order
+            if "names" in group_range["orig_group"]:
+                orig_params = group_range["orig_group"].get("_orig_params_for_names", [])
+                orig_names = group_range["orig_group"].get("_orig_names", [])
+                model_param_to_name = dict(zip(orig_params, orig_names))
+                new_names = []
+                for model_param in model_fp32_params_this_group:
+                    new_names.append(model_param_to_name.get(model_param, ""))
+                for model_param in model_float16_params_this_group:
+                    new_names.append(model_param_to_name.get(model_param, ""))
+                group_range["orig_group"]["names"] = new_names
 
         return (
             model_float16_groups,
@@ -832,10 +851,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for v in self.optimizer.state.values():
                     v["step"] = step.detach().clone()
 
+        # Save names before loading (load_state_dict may overwrite param_groups)
+        saved_names = [
+            {"names": pg.get("names", [])} for pg in self.optimizer.param_groups
+        ]
+
         # Optimizer.
         self.optimizer.load_state_dict(
             {"state": state_dict_state, "param_groups": state_dict_param_groups}
         )
+
+        # Restore names after loading (for optimizer stats logging)
+        for src, dst in zip(saved_names, self.optimizer.param_groups):
+            dst["names"] = src.get("names", [])
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
