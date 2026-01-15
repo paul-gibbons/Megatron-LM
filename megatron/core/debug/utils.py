@@ -136,7 +136,7 @@ class OptimizerInspectMixin:
         optimizer_state: Dict,
         iteration: int,
         reduction_group: Optional[torch.distributed.ProcessGroup] = None,
-        is_distributed_optimizer: bool = False,
+        is_distributed_optimizer: Optional[bool] = None,
     ) -> None:
         """Inspect a parameter and collect optimizer statistics."""
         import nvdlfw_inspect.api as debug_api
@@ -158,6 +158,13 @@ class OptimizerInspectMixin:
             enabled = result
 
         if enabled:
+            if is_distributed_optimizer is None:
+                config = getattr(self, "config", None)
+                is_distributed_optimizer = bool(
+                    getattr(config, "use_distributed_optimizer", False)
+                )
+            else:
+                is_distributed_optimizer = bool(is_distributed_optimizer)
             debug_api.megatron_core.inspect_optimizer_param(
                 layer_name=param_name,
                 param_name=param_name,

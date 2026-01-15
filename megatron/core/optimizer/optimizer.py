@@ -283,8 +283,7 @@ class MegatronOptimizer(ABC, OptimizerInspectMixin):
                     optimizer_state=optimizer_state,
                     iteration=iteration,
                     reduction_group=self.get_grad_stats_parallel_group(),
-                    is_distributed_optimizer=self.config.use_distributed_optimizer,
-        )
+                )
 
     @abstractmethod
     def zero_grad(self, set_to_none: bool = True):
