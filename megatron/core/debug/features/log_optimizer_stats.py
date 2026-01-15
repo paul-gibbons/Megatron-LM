@@ -61,7 +61,7 @@ class LogOptimizerStats(MCoreConfigAPIMapper):
             raise ValueError("[MCore Debug] per_token_topk must be a non-empty list of ints.")
         topk_int = []
         for k in topk:
-            k_int = int(k)
+                k_int = int(k)
             if k_int <= 0:
                 raise ValueError("[MCore Debug] per_token_topk entries must be > 0.")
             topk_int.append(k_int)

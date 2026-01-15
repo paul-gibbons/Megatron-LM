@@ -53,6 +53,28 @@ def _synchronize_param_names(
     return sorted(all_names)
 
 
+def _synchronize_num_zeros_thresholds(
+    local_thresholds: Set[float],
+    reduction_group: Optional[torch.distributed.ProcessGroup],
+) -> List[float]:
+    """Gather and sort num_zeros thresholds across all ranks for synchronized collective ops."""
+    if reduction_group is None or not torch.distributed.is_initialized():
+        return sorted(local_thresholds)
+
+    world_size = torch.distributed.get_world_size(group=reduction_group)
+    gathered_thresholds = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(
+        gathered_thresholds, local_thresholds, group=reduction_group
+    )
+
+    all_thresholds: Set[float] = set()
+    for thresholds in gathered_thresholds:
+        if thresholds:
+            all_thresholds.update(thresholds)
+
+    return sorted(all_thresholds)
+
+
 def extract_layer_key(param_name: str, aggregate_by: str) -> Optional[str]:
     """Extract layer key from param name for aggregation."""
     if aggregate_by == "layer":
@@ -280,12 +302,20 @@ class OptimizerStatsBuffers:
         self.reduction_group_to_buffers: Dict = defaultdict(list)
         self.at_least_one_fed = False
         self.aggregate_by: Optional[str] = None
+        self.default_reduction_group: Optional[torch.distributed.ProcessGroup] = None
 
     def reset(self):
         self.buffers.clear()
         self.reduction_group_to_buffers.clear()
         self.at_least_one_fed = False
         self.aggregate_by = None
+        self.default_reduction_group = None
+
+    def set_default_reduction_group(
+        self, reduction_group: Optional[torch.distributed.ProcessGroup]
+    ) -> None:
+        if reduction_group is not None:
+            self.default_reduction_group = reduction_group
 
     def try_add_buffer(self, param_name: str, stats: List[str],
                        reduction_group, aggregate_by: Optional[str] = None):
@@ -301,24 +331,54 @@ class OptimizerStatsBuffers:
              optimizer_state: Dict, stats: List[str], iteration: int,
              reduction_group=None, aggregate_by: Optional[str] = None):
         self.at_least_one_fed = True
+        self.set_default_reduction_group(reduction_group)
         self.try_add_buffer(param_name, stats, reduction_group, aggregate_by)
         self.buffers[param_name].feed(param, grad, optimizer_state, iteration)
 
+    def _get_reduction_group(self) -> Optional[torch.distributed.ProcessGroup]:
+        for buffers in self.reduction_group_to_buffers.values():
+            if buffers:
+                return buffers[0].reduction_group
+        if self.default_reduction_group is not None:
+            return self.default_reduction_group
+        return None
+
+    def _any_rank_has_data(
+        self, reduction_group: Optional[torch.distributed.ProcessGroup]
+    ) -> bool:
+        if reduction_group is None or not torch.distributed.is_initialized():
+            return self.at_least_one_fed
+
+        flag = torch.tensor(
+            [1 if self.at_least_one_fed else 0], device="cuda", dtype=torch.int32
+        )
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.SUM, group=reduction_group
+        )
+        has_any = bool(flag.item())
+        if not has_any:
+            self.at_least_one_fed = False
+        return has_any
+
+    def _collect_local_thresholds(self) -> Set[float]:
+        thresholds: Set[float] = set()
+        for buffer in self.buffers.values():
+            thresholds.update(buffer._num_zeros_thresholds)
+        return thresholds
+
     def log_stats(self, current_iter: int) -> Dict[Tuple, float]:
-        if not self.at_least_one_fed:
+        reduction_group = self._get_reduction_group()
+        if not self._any_rank_has_data(reduction_group):
             return {}
 
         if self.aggregate_by:
-            return self._log_aggregated(current_iter)
-
-        reduction_group = None
-        for buffers in self.reduction_group_to_buffers.values():
-            if buffers:
-                reduction_group = buffers[0].reduction_group
-                break
+            return self._log_aggregated(current_iter, reduction_group)
 
         local_names = set(self.buffers.keys())
         all_param_names = _synchronize_param_names(local_names, reduction_group)
+        all_thresholds = _synchronize_num_zeros_thresholds(
+            self._collect_local_thresholds(), reduction_group
+        )
 
         output = {}
         for param_name in all_param_names:
@@ -326,7 +386,9 @@ class OptimizerStatsBuffers:
                 buffer = self.buffers[param_name]
                 output.update(buffer.log_synchronized(reduction_group))
             elif reduction_group is not None:
-                self._participate_in_reduction_only(param_name, reduction_group)
+                self._participate_in_reduction_only(
+                    param_name, reduction_group, all_thresholds
+                )
 
         self.at_least_one_fed = False
         return output
@@ -335,31 +397,29 @@ class OptimizerStatsBuffers:
         self,
         param_name: str,
         reduction_group: torch.distributed.ProcessGroup,
+        thresholds: Optional[List[float]] = None,
     ) -> None:
         """Participate in all_reduce with zeros for a parameter this rank doesn't have."""
-        sample_buffer = next(iter(self.buffers.values()), None)
-        if sample_buffer is None:
-            return
-
         zero_buffer = torch.zeros(NUM_BUFFER_STATS, dtype=torch.float64, device="cuda")
         torch.distributed.all_reduce(
             zero_buffer, op=torch.distributed.ReduceOp.SUM, group=reduction_group
         )
 
-        thresholds = sorted(sample_buffer._num_zeros_thresholds)
         if thresholds:
             zero_data = torch.zeros(len(thresholds) + 1, dtype=torch.float64, device="cuda")
             torch.distributed.all_reduce(
                 zero_data, op=torch.distributed.ReduceOp.SUM, group=reduction_group
             )
 
-    def _log_aggregated(self, current_iter: int) -> Dict[Tuple, float]:
+    def _log_aggregated(
+        self,
+        current_iter: int,
+        reduction_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Dict[Tuple, float]:
         from megatron.core.debug.features.utils.stats_computation import parse_num_zeros_stat
 
-        reduction_group = None
-        for buffer in self.buffers.values():
-            reduction_group = buffer.reduction_group
-            break
+        if reduction_group is None:
+            reduction_group = self._get_reduction_group()
 
         local_grouped: Dict[str, List[_OptimizerStatsBuffer]] = defaultdict(list)
         for buffer in self.buffers.values():
@@ -378,8 +438,9 @@ class OptimizerStatsBuffers:
             all_thresholds.update(buffer._num_zeros_thresholds)
 
         if stats is None:
-            self.at_least_one_fed = False
-            return {}
+            stats = []
+
+        thresholds = _synchronize_num_zeros_thresholds(all_thresholds, reduction_group)
 
         output = {}
         for layer_key in all_layer_keys:
@@ -402,7 +463,6 @@ class OptimizerStatsBuffers:
                     combined, op=torch.distributed.ReduceOp.SUM, group=reduction_group
                 )
 
-                thresholds = sorted(all_thresholds)
                 if thresholds:
                     data = torch.zeros(len(thresholds) + 1, dtype=torch.float64, device="cuda")
                     for i, t in enumerate(thresholds):

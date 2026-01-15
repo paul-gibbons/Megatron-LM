@@ -39,6 +39,7 @@ except ImportError:
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..debug.debug_state import MCoreDebugState
+from ..debug.features.utils.optimizer_stats_buffer import OPTIMIZER_STATS_BUFFERS
 from ..debug.utils import OptimizerInspectMixin
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
@@ -256,6 +257,9 @@ class MegatronOptimizer(ABC, OptimizerInspectMixin):
             return
 
         use_decoupled_grad = self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        OPTIMIZER_STATS_BUFFERS.set_default_reduction_group(
+            self.get_grad_stats_parallel_group()
+        )
 
         for param_group in self.param_groups:
             params = param_group.get('params', [])
@@ -280,7 +284,7 @@ class MegatronOptimizer(ABC, OptimizerInspectMixin):
                     iteration=iteration,
                     reduction_group=self.get_grad_stats_parallel_group(),
                     is_distributed_optimizer=self.config.use_distributed_optimizer,
-                )
+        )
 
     @abstractmethod
     def zero_grad(self, set_to_none: bool = True):
