@@ -49,7 +49,7 @@ def compute_buffer_stats(
     if grad is not None:
         grad_f = grad.float()
 
-        if "grad_norm" in requested or "weight_grad_ratio" in requested:
+        if "grad_norm" in requested or "grad_rms" in requested or "weight_grad_ratio" in requested:
             buffer[STAT_INDICES["grad_norm_sq"]] = (grad_f ** 2).sum().item()
         if "weight_grad_ratio" in requested:
             buffer[STAT_INDICES["param_norm_sq"]] = (param.float() ** 2).sum().item()
@@ -85,6 +85,8 @@ def compute_final_stats(buffer: torch.Tensor, stats: List[str]) -> Dict[str, flo
             continue
         elif s == "grad_norm":
             results["grad_norm"] = buffer[STAT_INDICES["grad_norm_sq"]].item() ** 0.5
+        elif s == "grad_rms":
+            results["grad_rms"] = (buffer[STAT_INDICES["grad_norm_sq"]].item() / numel) ** 0.5
         elif s == "weight_grad_ratio":
             g = buffer[STAT_INDICES["grad_norm_sq"]].item() ** 0.5
             results["weight_grad_ratio"] = buffer[STAT_INDICES["param_norm_sq"]].item() ** 0.5 / g if g > 0 else float('inf')

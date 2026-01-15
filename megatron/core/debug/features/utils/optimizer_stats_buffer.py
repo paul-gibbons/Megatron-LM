@@ -63,6 +63,8 @@ def extract_layer_key(param_name: str, aggregate_by: str) -> Optional[str]:
             return "embedding"
         if "output_layer" in param_name:
             return "output_layer"
+        if "norm" in param_name.lower():
+            return "layernorm"
         return "other"
 
     if aggregate_by == "module":
