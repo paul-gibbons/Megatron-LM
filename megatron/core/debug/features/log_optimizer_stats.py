@@ -61,7 +61,7 @@ class LogOptimizerStats(MCoreConfigAPIMapper):
             raise ValueError("[MCore Debug] per_token_topk must be a non-empty list of ints.")
         topk_int = []
         for k in topk:
-                k_int = int(k)
+            k_int = int(k)
             if k_int <= 0:
                 raise ValueError("[MCore Debug] per_token_topk entries must be > 0.")
             topk_int.append(k_int)
@@ -292,20 +292,20 @@ class LogOptimizerStats(MCoreConfigAPIMapper):
 
         has_per_token = any(s.lower() == "per_token_grad_norm" for s in stats)
         if has_per_token:
-            if config.get("aggregate_by") is not None:
-                raise ValueError(
-                    "[MCore Debug] per_token_grad_norm does not support aggregate_by; "
-                    "target a single parameter (e.g., output_layer.weight) via layer_name_regex_pattern."
-                )
-            self._log_per_token_grad_norm(
-                config=config,
-                param_name=param_name,
-                grad=grad,
+                if config.get("aggregate_by") is not None:
+                    raise ValueError(
+                        "[MCore Debug] per_token_grad_norm does not support aggregate_by; "
+                        "target a single parameter (e.g., output_layer.weight) via layer_name_regex_pattern."
+                    )
+                self._log_per_token_grad_norm(
+                    config=config,
+                    param_name=param_name,
+                    grad=grad,
                 param=param,
-                iteration=iteration,
+                    iteration=iteration,
                 reduction_group=kwargs.get("reduction_group"),
                 is_distributed_optimizer=bool(kwargs.get("is_distributed_optimizer", False)),
-            )
+                )
 
         buffer_stats = [s for s in stats if s.lower() != "per_token_grad_norm"]
         if buffer_stats:
