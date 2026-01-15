@@ -39,6 +39,7 @@ except ImportError:
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..debug.debug_state import MCoreDebugState
+from ..debug.utils import OptimizerInspectMixin
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -97,7 +98,7 @@ def _multi_tensor_copy_this_to_that(
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
 
 
-class MegatronOptimizer(ABC):
+class MegatronOptimizer(ABC, OptimizerInspectMixin):
     """
     Base class for all Megatron optimizers.
 
@@ -247,11 +248,8 @@ class MegatronOptimizer(ABC):
 
     def log_optimizer_stats(self, iteration: int) -> None:
         """Log per-parameter optimizer statistics via nvdlfw_inspect."""
-        try:
-            import nvdlfw_inspect.api as debug_api
-            if debug_api.DEBUG_MANAGER is None:
-                return
-        except ImportError:
+        should_run = self._is_optim_debug_iter()
+        if not should_run:
             return
 
         if not self._param_names:
@@ -274,25 +272,15 @@ class MegatronOptimizer(ABC):
 
                 optimizer_state = self.optimizer.state.get(param, {}) if self.optimizer else {}
 
-                result = debug_api.megatron_core.inspect_optimizer_param_enabled(
-                    layer_name=name,
-                    param_name=name,
-                    iteration=iteration,
-                )
-
-                enabled = result[0] if isinstance(result, tuple) else result
-                if not enabled:
-                    continue
-
-                debug_api.megatron_core.inspect_optimizer_param(
-                    layer_name=name,
+                self._inspect_optimizer_param(
                     param_name=name,
                     param=param,
                     grad=grad,
                     optimizer_state=optimizer_state,
                     iteration=iteration,
                     reduction_group=self.get_grad_stats_parallel_group(),
-        )
+                    is_distributed_optimizer=self.config.use_distributed_optimizer,
+                )
 
     @abstractmethod
     def zero_grad(self, set_to_none: bool = True):

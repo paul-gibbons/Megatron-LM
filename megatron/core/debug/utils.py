@@ -14,7 +14,7 @@
 
 """Utility functions for MCore debug/inspection framework."""
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -107,6 +107,69 @@ class TensorInspectMixin:
             )
 
 
+class OptimizerInspectMixin:
+    """Mixin class for optimizers that support parameter inspection."""
+
+    _optim_next_debug_iter: Optional[int] = 0
+    _optim_debug_last_iteration: Optional[int] = None
+    _optim_debug_enabled_this_iter: bool = False
+
+    def _is_optim_debug_iter(self) -> bool:
+        """Check if this iteration should run optimizer debug inspection."""
+        MCoreDebugState.ensure_initialized()
+        if not MCoreDebugState.debug_enabled:
+            return False
+        current_iter = MCoreDebugState.get_iteration()
+        if self._optim_debug_last_iteration != current_iter:
+            self._optim_debug_enabled_this_iter = (
+                self._optim_next_debug_iter is not None
+                and current_iter >= self._optim_next_debug_iter
+            )
+            self._optim_debug_last_iteration = current_iter
+        return self._optim_debug_enabled_this_iter
+
+    def _inspect_optimizer_param(
+        self,
+        param_name: str,
+        param: torch.Tensor,
+        grad: Optional[torch.Tensor],
+        optimizer_state: Dict,
+        iteration: int,
+        reduction_group: Optional[torch.distributed.ProcessGroup] = None,
+        is_distributed_optimizer: bool = False,
+    ) -> None:
+        """Inspect a parameter and collect optimizer statistics."""
+        import nvdlfw_inspect.api as debug_api
+
+        result = debug_api.megatron_core.inspect_optimizer_param_enabled(
+            layer_name=param_name,
+            param_name=param_name,
+            iteration=iteration,
+        )
+
+        if isinstance(result, tuple):
+            enabled, next_iter = result
+            if next_iter is not None:
+                if self._optim_next_debug_iter is None:
+                    self._optim_next_debug_iter = next_iter
+                else:
+                    self._optim_next_debug_iter = min(self._optim_next_debug_iter, next_iter)
+        else:
+            enabled = result
+
+        if enabled:
+            debug_api.megatron_core.inspect_optimizer_param(
+                layer_name=param_name,
+                param_name=param_name,
+                param=param,
+                grad=grad,
+                optimizer_state=optimizer_state,
+                iteration=iteration,
+                reduction_group=reduction_group,
+                is_distributed_optimizer=is_distributed_optimizer,
+            )
+
+
 def compute_next_enabled_iter(
     start_step: Optional[int],
     end_step: Optional[int],
@@ -123,7 +186,7 @@ def compute_next_enabled_iter(
                 if current_iter % freq == 0:
                     next_iter = current_iter + freq
                     if next_iter > range_end:
-                        for ns, ne in start_end_list:
+                        for ns, _ in start_end_list:
                             if ns > current_iter:
                                 return True, ns
                         return True, None
