@@ -63,8 +63,12 @@ class TensorInspectMixin:
         return {}
 
     def _is_debug_iter(self) -> bool:
+        """Check if this iteration should run tensor debug inspection."""
         MCoreDebugState.ensure_initialized()
         if not MCoreDebugState.debug_enabled:
+            # Global debug disabled - ensure hooks are removed
+            if self._backward_hook_handles:
+                self._remove_backward_hooks()
             return False
         current_iter = MCoreDebugState.get_iteration()
         if self._debug_last_iteration != current_iter:
@@ -73,6 +77,13 @@ class TensorInspectMixin:
                 and current_iter >= self._next_debug_iter
             )
             self._debug_last_iteration = current_iter
+            # Dynamically manage hooks based on debug state
+            if self._debug_enabled_this_iter:
+                if not self._backward_hook_handles:
+                    self._setup_backward_hooks()
+            else:
+                if self._backward_hook_handles:
+                    self._remove_backward_hooks()
         return self._debug_enabled_this_iter
 
     def _inspect_tensor(self, tensor_name: str, tensor: torch.Tensor) -> None:
@@ -90,8 +101,11 @@ class TensorInspectMixin:
 
         if isinstance(result, tuple):
             enabled, next_iter = result
-            if next_iter is not None:
-                if self._next_debug_iter is None:
+            if next_iter is None:
+                if self._next_debug_iter is None or self._next_debug_iter <= iteration:
+                    self._next_debug_iter = None
+            else:
+                if self._next_debug_iter is None or self._next_debug_iter <= iteration:
                     self._next_debug_iter = next_iter
                 else:
                     self._next_debug_iter = min(self._next_debug_iter, next_iter)
@@ -126,8 +140,11 @@ class TensorInspectMixin:
 
         if isinstance(result, tuple):
             enabled, next_iter = result
-            if next_iter is not None:
-                if self._next_debug_iter is None:
+            if next_iter is None:
+                if self._next_debug_iter is None or self._next_debug_iter <= iteration:
+                    self._next_debug_iter = None
+            else:
+                if self._next_debug_iter is None or self._next_debug_iter <= iteration:
                     self._next_debug_iter = next_iter
                 else:
                     self._next_debug_iter = min(self._next_debug_iter, next_iter)
@@ -229,8 +246,11 @@ class OptimizerInspectMixin:
 
         if isinstance(result, tuple):
             enabled, next_iter = result
-            if next_iter is not None:
-                if self._optim_next_debug_iter is None:
+            if next_iter is None:
+                if self._optim_next_debug_iter is None or self._optim_next_debug_iter <= iteration:
+                    self._optim_next_debug_iter = None
+            else:
+                if self._optim_next_debug_iter is None or self._optim_next_debug_iter <= iteration:
                     self._optim_next_debug_iter = next_iter
                 else:
                     self._optim_next_debug_iter = min(self._optim_next_debug_iter, next_iter)
@@ -307,4 +327,3 @@ def compute_next_enabled_iter(
         if next_freq > end:
             return False, None
         return False, next_freq
-

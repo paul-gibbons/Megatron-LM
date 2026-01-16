@@ -257,8 +257,7 @@ class GPTModel(LanguageModule, TensorInspectMixin):
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
-        if self.post_process or (self.pre_process and self.share_embeddings_and_output_weights):
-            self._setup_backward_hooks()
+        #if self.post_process or (self.pre_process and self.share_embeddings_and_output_weights):
 
         if has_config_logger_enabled(self.config):
             log_config_to_disk(

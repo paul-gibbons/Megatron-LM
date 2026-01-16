@@ -202,7 +202,6 @@ class TopKRouter(Router, TensorInspectMixin):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        self._setup_backward_hooks()
 
     def _maintain_float32_expert_bias(self):
         """

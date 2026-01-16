@@ -86,7 +86,6 @@ class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
-        self._setup_backward_hooks()
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
@@ -122,6 +121,8 @@ class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
         Returns:
             Tensor: The output embeddings
         """
+        # Ensure debug gating runs before any forward ops that would capture hooks.
+        self._is_debug_iter()
         word_embeddings = self.word_embeddings(input_ids)
         self._inspect_tensor("word", word_embeddings)
 
