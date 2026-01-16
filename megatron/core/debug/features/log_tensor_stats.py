@@ -38,13 +38,13 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
         Basic: min, max, mean, std, sum, numel, variance
         Norms: l1_norm, l2_norm, cur_amax, dynamic_range
         Zero counting: num_zeros, num_zeros%, num_zeros[threshold]%
-        Per-element: per_element, per_element%
-        Vocab gradient: vocab_topk_l2_pct[k] (% of grad norm from top-k tokens)
+        Per-element (router tokens_per_expert only): per_element, per_element%
         Local only (not reducible): median, max_median_ratio, entropy, kurtosis
     """
 
     _BACKWARD_TENSOR_NAMES = {"wgrad", "dgrad", "gradient"}
     _NON_REDUCIBLE_STATS = {"median", "max_median_ratio", "entropy", "kurtosis"}
+    _PER_ELEMENT_TENSOR_NAMES = {"tokens_per_expert"}
     _warned_non_reducible = False
 
     def __init__(self):
@@ -97,20 +97,17 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
     def _validate_stats(self, stats: list) -> None:
         """Validate that all requested stats are supported."""
         from megatron.core.debug.features.utils.stats_computation import (
-            parse_num_zeros_stat, parse_vocab_topk_stat,
+            parse_num_zeros_stat,
         )
 
         supported = self._get_supported_stats_list()
         for stat in stats:
             if parse_num_zeros_stat(stat) is not None:
                 continue
-            if parse_vocab_topk_stat(stat) is not None:
-                continue
             if stat.lower() not in supported:
                 raise ValueError(
                     f"[MCore Debug] Unsupported stat: '{stat}'. "
-                    f"Supported stats: {sorted(supported)} "
-                    f"(also supports num_zeros[threshold]%, vocab_topk_l2_pct[k])"
+                    f"Supported stats: {sorted(supported)}"
                 )
 
     def _warn_non_reducible_stats(self, stats: list) -> None:
@@ -131,6 +128,28 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
                 )
             LogMCoreTensorStats._warned_non_reducible = True
 
+    def _validate_stats_for_tensor(
+        self, tensor_name: str, stats: list, tensor: torch.Tensor
+    ) -> None:
+        """Validate that certain stats are only used with supported tensors."""
+        stats_lower = {s.lower() for s in stats}
+        if not (stats_lower & {"per_element", "per_element%"}):
+            return
+
+        tensor_lower = tensor_name.lower()
+        if tensor_lower not in self._PER_ELEMENT_TENSOR_NAMES:
+            raise ValueError(
+                "[MCore Debug] per_element stats are only supported for "
+                f"{sorted(self._PER_ELEMENT_TENSOR_NAMES)}. "
+                "Use tensors_struct to apply per_element only to tokens_per_expert."
+            )
+
+        if tensor.dim() != 1:
+            raise ValueError(
+                "[MCore Debug] per_element stats require a 1D tensor for "
+                f"tokens_per_expert; got shape {tuple(tensor.shape)} for {tensor_name}."
+            )
+
     @api_method
     def inspect_tensor(
         self,
@@ -149,6 +168,7 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
         stats_to_collect = config.get("stats", ["min", "max", "mean"])
         self._validate_stats(stats_to_collect)
         self._warn_non_reducible_stats(stats_to_collect)
+        self._validate_stats_for_tensor(tensor_name, stats_to_collect, tensor)
 
         debug_api.log_message(
             f"Feature={self.__class__.__name__}, API=inspect_tensor: "
