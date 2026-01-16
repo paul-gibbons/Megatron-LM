@@ -16,11 +16,12 @@
 
 import math
 import re
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
 _NUM_ZEROS_PATTERN = re.compile(r'^num_zeros(?:\[([^\]]+)\])?(%)?$', re.IGNORECASE)
+_VOCAB_TOPK_PATTERN = re.compile(r'^vocab_topk_l2_pct\[(\d+)\]$', re.IGNORECASE)
 
 
 def parse_num_zeros_stat(stat: str) -> Optional[Tuple[float, bool]]:
@@ -29,6 +30,14 @@ def parse_num_zeros_stat(stat: str) -> Optional[Tuple[float, bool]]:
         return None
     threshold_str, pct_suffix = match.groups()
     return (float(threshold_str) if threshold_str else 0.0, pct_suffix is not None)
+
+
+def parse_vocab_topk_stat(stat: str) -> Optional[int]:
+    """Parse vocab_topk_l2_pct[k] stat, returns k if matched."""
+    match = _VOCAB_TOPK_PATTERN.match(stat.strip())
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def _get(buffers: torch.Tensor, idx: int) -> torch.Tensor:
@@ -114,7 +123,7 @@ STATS = {
     ),
     "l2_norm": (
         None,
-        lambda b: math.sqrt(float(_get(b, STAT_INDICES["l2_norm_sq"]).sum())),
+        lambda b: math.sqrt(float(_get(b, STAT_INDICES["l2_norm_sq"]).detach().sum())),
     ),
     "dynamic_range": (
         None,
@@ -124,7 +133,7 @@ STATS = {
 }
 
 
-@torch.compile
+@torch.no_grad()
 def _compute_dr_top(t: torch.Tensor) -> torch.Tensor:
     abs_t = t.float().abs()
     nonzero = abs_t[abs_t > 0]
@@ -133,7 +142,7 @@ def _compute_dr_top(t: torch.Tensor) -> torch.Tensor:
     return torch.tensor(0.0, device=t.device)
 
 
-@torch.compile
+@torch.no_grad()
 def _compute_dr_bottom(t: torch.Tensor) -> torch.Tensor:
     abs_t = t.float().abs()
     nonzero = abs_t[abs_t > 0]
@@ -142,7 +151,7 @@ def _compute_dr_bottom(t: torch.Tensor) -> torch.Tensor:
     return torch.tensor(0.0, device=t.device)
 
 
-@torch.compile
+@torch.no_grad()
 def _combine_variance(b: torch.Tensor) -> float:
     total_numel = _get(b, STAT_INDICES["numel"]).sum()
     total_sum = _get(b, STAT_INDICES["sum"]).sum()
@@ -183,3 +192,57 @@ def _compute_max_median_ratio(t: torch.Tensor) -> float:
     if median != 0:
         return (flat.max() / median).item()
     return float('inf')
+
+
+@torch.no_grad()
+def compute_per_row_l2_norms(tensor: torch.Tensor) -> torch.Tensor:
+    """Compute L2 norm for each row of a 2D tensor."""
+    if tensor.dim() != 2:
+        raise ValueError(f"Expected 2D tensor for per-row L2 norms, got {tensor.dim()}D")
+    return torch.linalg.norm(tensor.float(), dim=1)
+
+
+@torch.no_grad()
+def compute_vocab_stats(tensor: torch.Tensor) -> Dict[str, any]:
+    """Compute per-vocabulary gradient statistics for a 2D tensor."""
+    if tensor.dim() != 2:
+        return {}
+    
+    per_row_norms = compute_per_row_l2_norms(tensor)
+    sorted_norms, sorted_indices = torch.sort(per_row_norms, descending=True)
+    
+    # Total L2 norm of the full tensor
+    total_l2_norm_sq = (per_row_norms ** 2).sum()
+    total_l2_norm = torch.sqrt(total_l2_norm_sq)
+    
+    return {
+        "per_row_norms": per_row_norms,
+        "sorted_norms": sorted_norms,
+        "sorted_indices": sorted_indices,
+        "total_l2_norm": total_l2_norm.item(),
+        "total_l2_norm_sq": total_l2_norm_sq.item(),
+        "vocab_size": tensor.shape[0],
+    }
+
+
+@torch.no_grad()
+def compute_vocab_topk_l2_pct(vocab_stats: Dict, k: int) -> float:
+    """Compute cumulative L2 % contribution from top-k tokens."""
+    if not vocab_stats or "sorted_norms" not in vocab_stats:
+        return 0.0
+    
+    sorted_norms = vocab_stats["sorted_norms"]
+    total_l2_norm_sq = vocab_stats["total_l2_norm_sq"]
+    
+    if total_l2_norm_sq == 0:
+        return 0.0
+    
+    k = min(k, len(sorted_norms))
+    top_k_l2_sq = (sorted_norms[:k] ** 2).sum().item()
+    
+    return (top_k_l2_sq / total_l2_norm_sq) * 100.0
+
+
+def is_vocab_stat(stat: str) -> bool:
+    """Check if a stat is a vocab_topk_l2_pct[k] stat."""
+    return parse_vocab_topk_stat(stat) is not None

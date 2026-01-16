@@ -137,7 +137,10 @@ class MegatronCoreAPI(BaseNamespaceAPI):
         tensor_parsing = "tensor_name" in required_kwargs.get(api_name, [])
         param_parsing = "param_name" in required_kwargs.get(api_name, [])
         status, modified_config = feature_obj.parse_config_and_api(
-            config, tensor_parsing=tensor_parsing, param_parsing=param_parsing, **kwargs
+            config,
+            tensor_parsing=tensor_parsing,
+            param_parsing=param_parsing,
+            **kwargs,
         )
         return status, modified_config
 

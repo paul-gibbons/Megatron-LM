@@ -31,55 +31,19 @@ from megatron.core.debug.utils import compute_next_enabled_iter
 class LogMCoreTensorStats(MCoreConfigAPIMapper):
     """Log tensor statistics for Megatron-Core modules.
 
-    Collects stats for MoE router (logits, probs, map, scores, tokens, weight),
-    embeddings (word, position, tokentype, output), and output layer (input, logits).
-
+    Collects stats for MoE router, embeddings, output layer, and backward tensors.
     Statistics are buffered across micro-batches and logged on debug_api.step().
 
     Supported stats:
-        - Basic: min, max, mean, std, sum, numel, variance
-        - Norms: l1_norm, l2_norm, cur_amax
-        - Range: dynamic_range
-        - Zero counting (useful for FTZ detection):
-            - num_zeros: count of exact zeros
-            - num_zeros%: percentage of exact zeros
-            - num_zeros[threshold]: count of values where |x| < threshold
-            - num_zeros[threshold]%: percentage of values where |x| < threshold
-            Examples: num_zeros[1e-10], num_zeros[1e-20]%, num_zeros[1e-30]
-        - Quantiles: median, max_median_ratio (LOCAL ONLY - not reducible)
-        - Distribution: entropy, kurtosis (LOCAL ONLY - not reducible across ranks)
-        - Per-element (SUMMED across micro-batches):
-            - per_element: raw counts (expert0, expert1, ...)
-            - per_element%: percentages (expert0%, expert1%, ...)
-
-    Note on LOCAL ONLY stats:
-        Quantile stats (median, max_median_ratio), entropy, and kurtosis are computed
-        on the local tensor only and are NOT properly reducible across distributed
-        ranks. In distributed training, these stats represent local values.
-
-    Config options:
-        - stats: List of statistics to collect
-        - freq: Logging frequency (default: 1)
-        - start_step: First step to log (default: 0)
-        - end_step: Last step to log (default: -1 for unlimited)
-        - start_end_list: List of (start, end) ranges
-
-    Example YAML:
-        mcore_stats:
-          enabled: True
-          layers:
-            layer_name_regex_pattern: ".*\\.mlp\\.router"
-          megatron_core:
-            LogMCoreTensorStats:
-              enabled: True
-              tensors: [logits, tokens]
-              stats: [min, max, mean, std]
-              freq: 10
-              start_step: 1
-              end_step: 10000
+        Basic: min, max, mean, std, sum, numel, variance
+        Norms: l1_norm, l2_norm, cur_amax, dynamic_range
+        Zero counting: num_zeros, num_zeros%, num_zeros[threshold]%
+        Per-element: per_element, per_element%
+        Vocab gradient: vocab_topk_l2_pct[k] (% of grad norm from top-k tokens)
+        Local only (not reducible): median, max_median_ratio, entropy, kurtosis
     """
 
-    # Stats that cannot be properly reduced across distributed ranks
+    _BACKWARD_TENSOR_NAMES = {"wgrad", "dgrad", "gradient"}
     _NON_REDUCIBLE_STATS = {"median", "max_median_ratio", "entropy", "kurtosis"}
     _warned_non_reducible = False
 
@@ -87,8 +51,6 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
         super().__init__()
 
     def _get_supported_stats_list(self) -> set:
-        # Note: num_zeros supports parameterized syntax: num_zeros[threshold]%
-        # Validation handles this separately in _validate_stats
         return {
             "min", "max", "mean", "std", "sum", "numel", "variance",
             "median", "max_median_ratio", "kurtosis",
@@ -134,18 +96,21 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
 
     def _validate_stats(self, stats: list) -> None:
         """Validate that all requested stats are supported."""
-        from megatron.core.debug.features.utils.stats_buffer import parse_num_zeros_stat
-        
+        from megatron.core.debug.features.utils.stats_computation import (
+            parse_num_zeros_stat, parse_vocab_topk_stat,
+        )
+
         supported = self._get_supported_stats_list()
         for stat in stats:
-            # Check if it's a parameterized num_zeros stat
             if parse_num_zeros_stat(stat) is not None:
+                continue
+            if parse_vocab_topk_stat(stat) is not None:
                 continue
             if stat.lower() not in supported:
                 raise ValueError(
                     f"[MCore Debug] Unsupported stat: '{stat}'. "
                     f"Supported stats: {sorted(supported)} "
-                    f"(also supports num_zeros[threshold] and num_zeros[threshold]%)"
+                    f"(also supports num_zeros[threshold]%, vocab_topk_l2_pct[k])"
                 )
 
     def _warn_non_reducible_stats(self, stats: list) -> None:
@@ -182,8 +147,6 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
             return
 
         stats_to_collect = config.get("stats", ["min", "max", "mean"])
-        
-        # Validate stats
         self._validate_stats(stats_to_collect)
         self._warn_non_reducible_stats(stats_to_collect)
 
@@ -194,9 +157,11 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
             level=logging.INFO,
         )
         reduction_group = kwargs.get("reduction_group", None)
+        tp_group = kwargs.get("tp_group", None)
         skip_reduction = kwargs.get("skip_reduction", False)
 
-        reduce_within_microbatch = tensor_name.lower() not in ("weight",)
+        tensor_lower = tensor_name.lower()
+        reduce_within_microbatch = tensor_lower not in ("weight",)
         start_step = config.get("start_step", None)
         end_step = config.get("end_step", None)
         start_end_list = config.get("start_end_list", None)
@@ -211,6 +176,7 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
             options=options,
             reduction_group=reduction_group,
             reduce_within_microbatch=reduce_within_microbatch,
+            tp_group=tp_group,
         )
 
         MCORE_STATS_BUFFERS.feed(

@@ -15,8 +15,9 @@
 """Stats buffer for MCore tensor statistics."""
 
 import logging
+import math
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -25,7 +26,8 @@ from nvdlfw_inspect.utils import gather_along_first_dim
 
 from megatron.core.debug.features.utils.stats_computation import (
     STATS, STAT_INDICES, STAT_DEPENDENCIES, DIRECT_STATS, NUM_BUFFER_STATS,
-    parse_num_zeros_stat,
+    parse_num_zeros_stat, parse_vocab_topk_stat,
+    is_vocab_stat, compute_per_row_l2_norms, compute_vocab_topk_l2_pct,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,10 +43,12 @@ class _MCoreStatsBuffer:
         stats_to_log: List[str],
         reduction_group: Optional[torch.distributed.ProcessGroup],
         reduce_within_microbatch: bool = True,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.layer_name = layer_name
         self.tensor_name = tensor_name
         self.reduction_group = reduction_group
+        self.tp_group = tp_group  # For vocab stats: TP gather, then DP reduce
         self.reduce_within_microbatch = reduce_within_microbatch
         self.stats_to_log = stats_to_log
 
@@ -62,21 +66,29 @@ class _MCoreStatsBuffer:
 
         self._direct_stats: Dict[str, float] = {}
         self._per_element_acc: Optional[torch.Tensor] = None
-        self._num_zeros: Dict[float, int] = {}
-        self._num_zeros_numel = 0
-        self._num_zeros_thresholds = set()
+        self._num_zeros_counts: Dict[float, torch.Tensor] = {}
+        self._num_zeros_numel: Optional[torch.Tensor] = None
+        self._num_zeros_thresholds: Set[float] = set()
+        self._vocab_stats_requested = False
+        self._vocab_accumulated_stats: Optional[Dict] = None
+
         for stat in stats_to_log:
             parsed = parse_num_zeros_stat(stat)
             if parsed:
                 self._num_zeros_thresholds.add(parsed[0])
+            if is_vocab_stat(stat):
+                self._vocab_stats_requested = True
 
     def _reset(self):
         self._buffer.zero_()
         self.modified[0] = False
         self._direct_stats.clear()
         self._per_element_acc = None
-        self._num_zeros.clear()
-        self._num_zeros_numel = 0
+        self._num_zeros_counts.clear()
+        self._num_zeros_numel = None
+        self._num_zeros_reduced = False
+        self._vocab_accumulated_stats = None
+        self._vocab_finalized_stats = None
 
     def feed(self, tensor: torch.Tensor, iteration: int, skip_reduction: bool = False):
         self.iteration = iteration
@@ -122,10 +134,29 @@ class _MCoreStatsBuffer:
 
         if self._num_zeros_thresholds:
             abs_t = tensor.float().abs()
-            self._num_zeros_numel += tensor.numel()
+            numel_t = torch.tensor([tensor.numel()], dtype=torch.float32, device="cuda")
+            if self._num_zeros_numel is None:
+                self._num_zeros_numel = numel_t
+            else:
+                self._num_zeros_numel += numel_t
             for threshold in self._num_zeros_thresholds:
-                count = (tensor == 0).sum().item() if threshold == 0.0 else (abs_t < threshold).sum().item()
-                self._num_zeros[threshold] = self._num_zeros.get(threshold, 0) + count
+                count = (tensor == 0).sum() if threshold == 0.0 else (abs_t < threshold).sum()
+                count_t = count.float().unsqueeze(0)
+                if threshold not in self._num_zeros_counts:
+                    self._num_zeros_counts[threshold] = count_t
+                else:
+                    self._num_zeros_counts[threshold] += count_t
+
+        if self._vocab_stats_requested and tensor.dim() == 2:
+            per_row_norms = compute_per_row_l2_norms(tensor)
+            per_row_norms_sq = per_row_norms ** 2
+            if self._vocab_accumulated_stats is None:
+                self._vocab_accumulated_stats = {
+                    "per_row_norms_sq_sum": per_row_norms_sq.clone(),
+                    "vocab_size": tensor.shape[0],
+                }
+            else:
+                self._vocab_accumulated_stats["per_row_norms_sq_sum"] += per_row_norms_sq
 
         self.modified[0] = True
 
@@ -155,6 +186,11 @@ class _MCoreStatsBuffer:
             parsed = parse_num_zeros_stat(stat)
             if parsed:
                 self._log_num_zeros(stat, parsed, output)
+                continue
+
+            # Handle vocab stats
+            if is_vocab_stat(stat):
+                self._log_vocab_stat(stat, output)
                 continue
 
             if stat_lower in self._direct_stats:
@@ -199,19 +235,87 @@ class _MCoreStatsBuffer:
                 val = pct
             output[(self.layer_name, self.tensor_name, key, self.iteration)] = val.item() if isinstance(val, torch.Tensor) else val
 
+    def _reduce_num_zeros_once(self):
+        """All-reduce num_zeros counts and numel once."""
+        if getattr(self, "_num_zeros_reduced", False):
+            return
+        if self.skip_reduction or self.reduction_group is None:
+            self._num_zeros_reduced = True
+            return
+        if self._num_zeros_numel is not None:
+            torch.distributed.all_reduce(self._num_zeros_numel, group=self.reduction_group)
+        for count_t in self._num_zeros_counts.values():
+            torch.distributed.all_reduce(count_t, group=self.reduction_group)
+        self._num_zeros_reduced = True
+
     def _log_num_zeros(self, stat: str, parsed: Tuple[float, bool], output: dict):
         threshold, is_pct = parsed
-        count = self._num_zeros.get(threshold, 0)
+        count_t = self._num_zeros_counts.get(threshold)
+        if count_t is None or self._num_zeros_numel is None:
+            return
+
+        # Reduce all num_zeros counts once
+        self._reduce_num_zeros_once()
+
+        count = count_t.item()
+        numel = self._num_zeros_numel.item()
 
         threshold_str = "" if threshold == 0.0 else f"[{threshold:g}]"
         if is_pct:
-            value = (count / self._num_zeros_numel * 100) if self._num_zeros_numel > 0 else 0.0
+            value = (count / numel * 100) if numel > 0 else 0.0
             stat_name = f"num_zeros{threshold_str}%"
         else:
             value = count
             stat_name = f"num_zeros{threshold_str}"
 
         MetricLogger.log_scalar(f"{self.layer_name}_{self.tensor_name}_{stat_name}", value, self.iteration)
+        output[(self.layer_name, self.tensor_name, stat_name, self.iteration)] = value
+
+    def _finalize_vocab_stats_once(self):
+        """Reduce and finalize vocab stats once."""
+        if getattr(self, "_vocab_finalized_stats", None) is not None:
+            return self._vocab_finalized_stats
+        if self._vocab_accumulated_stats is None:
+            return None
+
+        per_row_norms_sq = self._vocab_accumulated_stats["per_row_norms_sq_sum"].clone()
+
+        if not self.skip_reduction:
+            if self.tp_group is not None:
+                per_row_norms_sq, _ = gather_along_first_dim(
+                    per_row_norms_sq, process_group=self.tp_group
+                )
+            if self.reduction_group is not None and self.reduction_group != self.tp_group:
+                torch.distributed.all_reduce(per_row_norms_sq, group=self.reduction_group)
+        
+        per_row_norms = torch.sqrt(per_row_norms_sq)
+        sorted_norms, sorted_indices = torch.sort(per_row_norms, descending=True)
+        total_l2_norm_sq = per_row_norms_sq.sum().item()
+
+        self._vocab_finalized_stats = {
+            "per_row_norms": per_row_norms,
+            "sorted_norms": sorted_norms,
+            "sorted_indices": sorted_indices,
+            "total_l2_norm_sq": total_l2_norm_sq,
+            "total_l2_norm": math.sqrt(total_l2_norm_sq) if total_l2_norm_sq > 0 else 0.0,
+            "vocab_size": per_row_norms.shape[0],
+        }
+        return self._vocab_finalized_stats
+
+    def _log_vocab_stat(self, stat: str, output: dict):
+        """Log vocab_topk_l2_pct[k] statistics."""
+        finalized_stats = self._finalize_vocab_stats_once()
+        if finalized_stats is None:
+            return
+
+        topk = parse_vocab_topk_stat(stat)
+        if topk is None:
+            return
+
+        value = compute_vocab_topk_l2_pct(finalized_stats, topk)
+        stat_name = f"vocab_topk_l2_pct[{topk}]"
+        metric_name = f"{self.layer_name}_{self.tensor_name}_{stat_name}"
+        MetricLogger.log_scalar(metric_name, value, self.iteration)
         output[(self.layer_name, self.tensor_name, stat_name, self.iteration)] = value
 
 
@@ -231,11 +335,14 @@ class MCoreStatsBuffers:
         self.layers_to_next_iter.clear()
 
     def try_add_buffer(self, layer_name: str, tensor_name: str, stats: List[str],
-                       options: tuple, reduction_group, reduce_within_microbatch: bool = True):
+                       options: tuple, reduction_group, reduce_within_microbatch: bool = True,
+                       tp_group=None):
         key = (layer_name, tensor_name, options)
         if key in self.buffers:
             return
-        buffer = _MCoreStatsBuffer(layer_name, tensor_name, stats, reduction_group, reduce_within_microbatch)
+        buffer = _MCoreStatsBuffer(
+            layer_name, tensor_name, stats, reduction_group, reduce_within_microbatch, tp_group
+        )
         self.buffers[key] = buffer
         self.reduction_group_to_buffers[reduction_group].append(buffer)
 

@@ -202,6 +202,8 @@ class TopKRouter(Router, TensorInspectMixin):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
+        self._setup_backward_hooks()
+
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.
@@ -221,6 +223,9 @@ class TopKRouter(Router, TensorInspectMixin):
 
     def _get_reduction_group(self):
         return self.tp_cp_group
+
+    def _get_gradient_targets(self):
+        return {"wgrad": self, "dgrad": self}
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.

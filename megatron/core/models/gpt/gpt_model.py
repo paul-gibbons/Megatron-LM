@@ -257,6 +257,9 @@ class GPTModel(LanguageModule, TensorInspectMixin):
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
+        if self.post_process or (self.pre_process and self.share_embeddings_and_output_weights):
+            self._setup_backward_hooks()
+
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
@@ -289,6 +292,17 @@ class GPTModel(LanguageModule, TensorInspectMixin):
 
     def _get_reduction_group(self):
         return self.pg_collection.tp if hasattr(self, 'pg_collection') else None
+
+    def _get_gradient_targets(self):
+        targets = {}
+        if self.share_embeddings_and_output_weights and self.pre_process:
+            if hasattr(self, 'embedding') and hasattr(self.embedding, 'word_embeddings'):
+                targets["wgrad"] = self.embedding.word_embeddings
+        elif self.post_process:
+            targets["wgrad"] = getattr(self, 'output_layer', None)
+        if self.post_process:
+            targets["dgrad"] = getattr(self, 'output_layer', None)
+        return targets
 
     def _preprocess(
         self,

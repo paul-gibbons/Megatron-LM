@@ -48,14 +48,19 @@ class TensorInspectMixin:
     _next_debug_iter: Optional[int] = 0
     _debug_last_iteration: Optional[int] = None
     _debug_enabled_this_iter: bool = False
+    _backward_hook_handles: Dict[str, torch.utils.hooks.RemovableHandle] = None
 
     def _get_debug_name(self) -> str:
         """Return the layer name for debug logging."""
         raise NotImplementedError
 
     def _get_reduction_group(self) -> Optional[torch.distributed.ProcessGroup]:
-        """Return the process group for weight tensor reduction (typically TP group)."""
+        """Return the TP process group for weight tensor reduction."""
         return None
+
+    def _get_gradient_targets(self) -> Dict[str, torch.nn.Module]:
+        """Return {tensor_name: module} for gradient hooks (wgrad/dgrad)."""
+        return {}
 
     def _is_debug_iter(self) -> bool:
         MCoreDebugState.ensure_initialized()
@@ -105,6 +110,81 @@ class TensorInspectMixin:
                 reduction_group=reduction_group,
                 skip_reduction=skip_reduction,
             )
+
+    def _inspect_backward_tensor(self, tensor_name: str, grad: torch.Tensor) -> None:
+        """Inspect a backward tensor (wgrad/dgrad) and collect statistics."""
+        if not self._is_debug_iter():
+            return
+        import nvdlfw_inspect.api as debug_api
+
+        layer_name = self._get_debug_name()
+        iteration = MCoreDebugState.get_iteration()
+
+        result = debug_api.megatron_core.inspect_tensor_enabled(
+            layer_name=layer_name, tensor_name=tensor_name, iteration=iteration
+        )
+
+        if isinstance(result, tuple):
+            enabled, next_iter = result
+            if next_iter is not None:
+                if self._next_debug_iter is None:
+                    self._next_debug_iter = next_iter
+                else:
+                    self._next_debug_iter = min(self._next_debug_iter, next_iter)
+        else:
+            enabled = result
+
+        if enabled:
+            reduction_group = debug_api.get_tensor_reduction_group()
+            debug_api.megatron_core.inspect_tensor(
+                layer_name=layer_name,
+                tensor_name=tensor_name,
+                tensor=grad,
+                iteration=iteration,
+                reduction_group=reduction_group,
+                skip_reduction=reduction_group is None,
+                tp_group=self._get_reduction_group(),
+            )
+
+    def _setup_backward_hooks(self) -> None:
+        """Register backward hooks for gradient inspection."""
+        MCoreDebugState.ensure_initialized()
+        if not MCoreDebugState.debug_enabled:
+            return
+
+        if self._backward_hook_handles is None:
+            self._backward_hook_handles = {}
+
+        targets = self._get_gradient_targets()
+        for tensor_name, module in targets.items():
+            if module is None:
+                continue
+
+            if tensor_name.lower() == "wgrad":
+                if not hasattr(module, 'weight') or module.weight is None:
+                    continue
+                def make_wgrad_hook(tname: str):
+                    def hook(grad: torch.Tensor) -> torch.Tensor:
+                        self._inspect_backward_tensor(tname, grad)
+                        return grad
+                    return hook
+                handle = module.weight.register_hook(make_wgrad_hook(tensor_name))
+            else:
+                def make_dgrad_hook(tname: str):
+                    def hook(_, grad_input, grad_output):
+                        if grad_input and grad_input[0] is not None:
+                            self._inspect_backward_tensor(tname, grad_input[0])
+                    return hook
+                handle = module.register_full_backward_hook(make_dgrad_hook(tensor_name))
+
+            self._backward_hook_handles[tensor_name] = handle
+
+    def _remove_backward_hooks(self) -> None:
+        """Remove all registered backward hooks."""
+        if self._backward_hook_handles is not None:
+            for handle in self._backward_hook_handles.values():
+                handle.remove()
+            self._backward_hook_handles.clear()
 
 
 class OptimizerInspectMixin:

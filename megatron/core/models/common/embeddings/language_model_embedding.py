@@ -86,6 +86,8 @@ class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
+        self._setup_backward_hooks()
+
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
         self.word_embeddings.weight.data.fill_(0)
@@ -103,6 +105,9 @@ class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
 
     def _get_reduction_group(self):
         return self.tp_group
+
+    def _get_gradient_targets(self):
+        return {"wgrad": self.word_embeddings, "dgrad": self}
 
     @nvtx_decorator()
     def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
