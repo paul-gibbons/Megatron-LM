@@ -152,66 +152,6 @@ class _OptimizerStatsBuffer:
 
         self.modified[0] = True
 
-    def _reduce_buffer(self) -> torch.Tensor:
-        if self.reduction_group is None:
-            return self._buffer
-        reduced = self._buffer.clone()
-        torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM, group=self.reduction_group)
-        return reduced
-
-    def _reduce_num_zeros(self) -> Tuple[Dict[float, float], int]:
-        if self.reduction_group is None:
-            return self._num_zeros.copy(), self._num_zeros_numel
-
-        thresholds = sorted(self._num_zeros_thresholds)
-        if not thresholds:
-            return {}, 0
-
-        data = torch.zeros(len(thresholds) + 1, dtype=torch.float64, device="cuda")
-        for i, t in enumerate(thresholds):
-            data[i] = self._num_zeros.get(t, 0)
-        data[-1] = self._num_zeros_numel
-        torch.distributed.all_reduce(data, op=torch.distributed.ReduceOp.SUM, group=self.reduction_group)
-
-        reduced_counts = {t: data[i].item() for i, t in enumerate(thresholds)}
-        reduced_numel = int(data[-1].item())
-        return reduced_counts, reduced_numel
-
-    def log(self) -> Dict[Tuple, float]:
-        if not self.modified[0]:
-            return {}
-
-        output = {}
-        name_prefix = extract_layer_key(self.param_name, self.aggregate_by) if self.aggregate_by else self.param_name
-        reduced_buffer = self._reduce_buffer()
-        reduced_num_zeros, reduced_numel = self._reduce_num_zeros()
-
-        from megatron.core.debug.features.utils.stats_computation import parse_num_zeros_stat
-        for stat in self.stats:
-            parsed = parse_num_zeros_stat(stat)
-            if parsed:
-                threshold, is_pct = parsed
-                count = reduced_num_zeros.get(threshold, 0)
-                threshold_str = "" if threshold == 0.0 else f"[{threshold:g}]"
-                if is_pct:
-                    value = 100.0 * count / reduced_numel if reduced_numel > 0 else 0.0
-                    stat_name = f"num_zeros{threshold_str}%"
-                else:
-                    value = count
-                    stat_name = f"num_zeros{threshold_str}"
-                metric_name = f"optimizer_{name_prefix}_{stat_name}"
-                MetricLogger.log_scalar(metric_name, value, self.iteration)
-                output[(name_prefix, stat_name, self.iteration)] = value
-
-        final = compute_final_stats(reduced_buffer, self.stats)
-        for stat_name, value in final.items():
-            metric_name = f"optimizer_{name_prefix}_{stat_name}"
-            MetricLogger.log_scalar(metric_name, value, self.iteration)
-            output[(name_prefix, stat_name, self.iteration)] = value
-
-        self._reset()
-        return output
-
     def log_synchronized(
         self,
         reduction_group: Optional[torch.distributed.ProcessGroup],

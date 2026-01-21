@@ -203,29 +203,6 @@ def compute_per_row_l2_norms(tensor: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def compute_vocab_stats(tensor: torch.Tensor) -> Dict[str, any]:
-    """Compute per-vocabulary gradient statistics for a 2D tensor."""
-    if tensor.dim() != 2:
-        return {}
-    
-    per_row_norms = compute_per_row_l2_norms(tensor)
-    sorted_norms, sorted_indices = torch.sort(per_row_norms, descending=True)
-    
-    # Total L2 norm of the full tensor
-    total_l2_norm_sq = (per_row_norms ** 2).sum()
-    total_l2_norm = torch.sqrt(total_l2_norm_sq)
-    
-    return {
-        "per_row_norms": per_row_norms,
-        "sorted_norms": sorted_norms,
-        "sorted_indices": sorted_indices,
-        "total_l2_norm": total_l2_norm.item(),
-        "total_l2_norm_sq": total_l2_norm_sq.item(),
-        "vocab_size": tensor.shape[0],
-    }
-
-
-@torch.no_grad()
 def compute_vocab_topk_l2_pct(vocab_stats: Dict, k: int) -> float:
     """Compute cumulative L2 % contribution from top-k tokens."""
     if not vocab_stats or "sorted_norms" not in vocab_stats:

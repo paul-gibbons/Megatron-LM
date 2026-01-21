@@ -21,8 +21,6 @@ from typing import Optional
 class MCoreDebugState:
     """Manages debug state for Megatron-Core modules."""
     debug_enabled: Optional[bool] = None
-    layer_count: int = 1
-    layers_initialized: dict = {}
     weight_tensor_tp_group_reduce: bool = True
 
     @classmethod
@@ -42,20 +40,7 @@ class MCoreDebugState:
     @classmethod
     def _reset(cls) -> None:
         cls.debug_enabled = None
-        cls.layer_count = 1
-        cls.layers_initialized.clear()
         cls.weight_tensor_tp_group_reduce = True
-
-    @classmethod
-    def set_weight_tensor_tp_group_reduce(cls, enabled: bool) -> None:
-        """Set whether weight tensor stats should be reduced across TP group."""
-        cls.weight_tensor_tp_group_reduce = enabled
-
-    @classmethod
-    def get_layer_count(cls) -> int:
-        count = cls.layer_count
-        cls.layer_count += 1
-        return count
 
     @classmethod
     def get_iteration(cls) -> int:
