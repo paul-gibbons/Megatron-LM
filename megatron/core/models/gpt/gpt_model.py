@@ -8,7 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.debug.utils import TensorInspectMixin
+from megatron.core.debug.utils import inspect_tensor, manage_backward_hooks
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
@@ -43,7 +43,7 @@ from megatron.core.utils import (
 )
 
 
-class GPTModel(LanguageModule, TensorInspectMixin):
+class GPTModel(LanguageModule):
     """GPT Transformer language model.
 
     Args:
@@ -257,8 +257,6 @@ class GPTModel(LanguageModule, TensorInspectMixin):
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
-        #if self.post_process or (self.pre_process and self.share_embeddings_and_output_weights):
-
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
@@ -283,25 +281,6 @@ class GPTModel(LanguageModule, TensorInspectMixin):
 
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
-
-    def _get_debug_name(self) -> str:
-        if self._debug_name is None:
-            self._debug_name = "output_layer"
-        return self._debug_name
-
-    def _get_reduction_group(self):
-        return self.pg_collection.tp if hasattr(self, 'pg_collection') else None
-
-    def _get_gradient_targets(self):
-        targets = {}
-        if self.share_embeddings_and_output_weights and self.pre_process:
-            if hasattr(self, 'embedding') and hasattr(self.embedding, 'word_embeddings'):
-                targets["wgrad"] = self.embedding.word_embeddings
-        elif self.post_process:
-            targets["wgrad"] = getattr(self, 'output_layer', None)
-        if self.post_process:
-            targets["dgrad"] = getattr(self, 'output_layer', None)
-        return targets
 
     def _preprocess(
         self,
@@ -678,13 +657,24 @@ class GPTModel(LanguageModule, TensorInspectMixin):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        self._inspect_tensor("input", hidden_states)
+        layer_name = "output_layer"
+        reduction_group = self.pg_collection.tp if hasattr(self, 'pg_collection') else None
+        gradient_targets = {}
+        if self.share_embeddings_and_output_weights and self.pre_process:
+            if hasattr(self, 'embedding') and hasattr(self.embedding, 'word_embeddings'):
+                gradient_targets["wgrad"] = self.embedding.word_embeddings
+        elif self.post_process:
+            gradient_targets["wgrad"] = getattr(self, 'output_layer', None)
+        if self.post_process:
+            gradient_targets["dgrad"] = getattr(self, 'output_layer', None)
+        manage_backward_hooks(layer_name, gradient_targets, reduction_group=reduction_group)
+        inspect_tensor(layer_name, "input", hidden_states, reduction_group=reduction_group)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
 
-        self._inspect_tensor("logits", logits)
+        inspect_tensor(layer_name, "logits", logits, reduction_group=reduction_group)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

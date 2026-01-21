@@ -40,7 +40,7 @@ from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..debug.debug_state import MCoreDebugState
 from ..debug.features.utils.optimizer_stats_buffer import OPTIMIZER_STATS_BUFFERS
-from ..debug.utils import OptimizerInspectMixin
+from ..debug.utils import inspect_optimizer_param, is_optim_debug_iter
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -99,7 +99,7 @@ def _multi_tensor_copy_this_to_that(
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
 
 
-class MegatronOptimizer(ABC, OptimizerInspectMixin):
+class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
 
@@ -249,14 +249,16 @@ class MegatronOptimizer(ABC, OptimizerInspectMixin):
 
     def log_optimizer_stats(self, iteration: int) -> None:
         """Log per-parameter optimizer statistics via nvdlfw_inspect."""
-        should_run = self._is_optim_debug_iter()
-        if not should_run:
+        if not is_optim_debug_iter(self.optimizer if self.optimizer else self):
             return
 
         if not self._param_names:
             return
 
         use_decoupled_grad = self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        is_distributed_optimizer = bool(
+            getattr(self.config, "use_distributed_optimizer", False)
+        )
         OPTIMIZER_STATS_BUFFERS.set_default_reduction_group(
             self.get_grad_stats_parallel_group()
         )
@@ -276,13 +278,15 @@ class MegatronOptimizer(ABC, OptimizerInspectMixin):
 
                 optimizer_state = self.optimizer.state.get(param, {}) if self.optimizer else {}
 
-                self._inspect_optimizer_param(
+                inspect_optimizer_param(
+                    optimizer=self.optimizer if self.optimizer else self,
                     param_name=name,
                     param=param,
                     grad=grad,
                     optimizer_state=optimizer_state,
                     iteration=iteration,
                     reduction_group=self.get_grad_stats_parallel_group(),
+                    is_distributed_optimizer=is_distributed_optimizer,
                 )
 
     @abstractmethod

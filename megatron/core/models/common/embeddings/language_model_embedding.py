@@ -6,13 +6,13 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.debug.utils import TensorInspectMixin
+from megatron.core.debug.utils import inspect_tensor, manage_backward_hooks
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, nvtx_decorator
 
 
-class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
+class LanguageModelEmbedding(MegatronModule):
     """Language model embeddings.
 
     Args:
@@ -86,7 +86,6 @@ class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
-
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
         self.word_embeddings.weight.data.fill_(0)
@@ -96,17 +95,6 @@ class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
         if self.num_tokentypes > 0:
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
-
-    def _get_debug_name(self) -> str:
-        if self._debug_name is None:
-            self._debug_name = "embedding"
-        return self._debug_name
-
-    def _get_reduction_group(self):
-        return self.tp_group
-
-    def _get_gradient_targets(self):
-        return {"wgrad": self.word_embeddings, "dgrad": self}
 
     @nvtx_decorator()
     def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
@@ -121,14 +109,16 @@ class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
         Returns:
             Tensor: The output embeddings
         """
-        # Ensure debug gating runs before any forward ops that would capture hooks.
-        self._is_debug_iter()
+        layer_name = "embedding"
+        gradient_targets = {"wgrad": self.word_embeddings, "dgrad": self}
+        manage_backward_hooks(layer_name, gradient_targets, reduction_group=self.tp_group)
+
         word_embeddings = self.word_embeddings(input_ids)
-        self._inspect_tensor("word", word_embeddings)
+        inspect_tensor(layer_name, "word", word_embeddings, reduction_group=self.tp_group)
 
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
-            self._inspect_tensor("position", position_embeddings)
+            inspect_tensor(layer_name, "position", position_embeddings, reduction_group=self.tp_group)
             embeddings = word_embeddings + position_embeddings
         else:
             embeddings = word_embeddings
@@ -141,12 +131,12 @@ class LanguageModelEmbedding(MegatronModule, TensorInspectMixin):
             assert self.tokentype_embeddings is not None
             # [b s h] -> [s b h] (So that it can be added with embeddings)
             tokentype_embedding = self.tokentype_embeddings(tokentype_ids).permute(1, 0, 2)
-            self._inspect_tensor("tokentype", tokentype_embedding)
+            inspect_tensor(layer_name, "tokentype", tokentype_embedding, reduction_group=self.tp_group)
             embeddings = embeddings + tokentype_embedding
         else:
             assert self.tokentype_embeddings is None
 
-        self._inspect_tensor("output", embeddings)
+        inspect_tensor(layer_name, "output", embeddings, reduction_group=self.tp_group)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:

@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from megatron.core.debug.utils import TensorInspectMixin
+from megatron.core.debug.utils import inspect_tensor, manage_backward_hooks
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
@@ -128,7 +128,7 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
 
 
-class TopKRouter(Router, TensorInspectMixin):
+class TopKRouter(Router):
     """Route each token to the top-k experts.
 
     The workflow of TopKRouter is as follows:
@@ -202,7 +202,6 @@ class TopKRouter(Router, TensorInspectMixin):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.
@@ -213,18 +212,6 @@ class TopKRouter(Router, TensorInspectMixin):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
-
-    def _get_debug_name(self) -> str:
-        if self._debug_name is None:
-            layer_num = self.layer_number if self.layer_number is not None else 0
-            self._debug_name = f"decoder.layers.{layer_num}.mlp.router"
-        return self._debug_name
-
-    def _get_reduction_group(self):
-        return self.tp_cp_group
-
-    def _get_gradient_targets(self):
-        return {"wgrad": self, "dgrad": self}
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -517,10 +504,13 @@ class TopKRouter(Router, TensorInspectMixin):
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
         """
+        layer_num = self.layer_number if self.layer_number is not None else 0
+        layer_name = f"decoder.layers.{layer_num}.mlp.router"
+
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
-        self._inspect_tensor("router_logits", logits)
+        inspect_tensor(layer_name, "router_logits", logits, reduction_group=self.tp_cp_group)
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
@@ -541,8 +531,8 @@ class TopKRouter(Router, TensorInspectMixin):
                 fused=self.config.moe_router_fusion,
             )
 
-        self._inspect_tensor("router_probs", probs)
-        self._inspect_tensor("routing_map", routing_map.float())
+        inspect_tensor(layer_name, "router_probs", probs, reduction_group=self.tp_cp_group)
+        inspect_tensor(layer_name, "routing_map", routing_map.float(), reduction_group=self.tp_cp_group)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -562,7 +552,7 @@ class TopKRouter(Router, TensorInspectMixin):
                 logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
             )
 
-            self._inspect_tensor("routing_scores", scores_for_aux_loss)
+            inspect_tensor(layer_name, "routing_scores", scores_for_aux_loss, reduction_group=self.tp_cp_group)
 
             probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
             probs = self._apply_seq_aux_loss(
@@ -575,7 +565,7 @@ class TopKRouter(Router, TensorInspectMixin):
         self._apply_expert_bias(routing_map)
 
         tokens_per_expert = routing_map.sum(dim=0).float()
-        self._inspect_tensor("tokens_per_expert", tokens_per_expert)
+        inspect_tensor(layer_name, "tokens_per_expert", tokens_per_expert, reduction_group=self.tp_cp_group)
 
         return probs, routing_map
 
@@ -594,7 +584,12 @@ class TopKRouter(Router, TensorInspectMixin):
         """
         self._maintain_float32_expert_bias()
 
-        self._inspect_tensor("router_weight", self.weight)
+        layer_num = self.layer_number if self.layer_number is not None else 0
+        layer_name = f"decoder.layers.{layer_num}.mlp.router"
+        gradient_targets = {"wgrad": self, "dgrad": self}
+        manage_backward_hooks(layer_name, gradient_targets, reduction_group=self.tp_cp_group)
+
+        inspect_tensor(layer_name, "router_weight", self.weight, reduction_group=self.tp_cp_group)
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
