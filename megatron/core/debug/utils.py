@@ -34,7 +34,6 @@ def get_reduction_params(
     import nvdlfw_inspect.api as debug_api
 
     skip_reduction = False
-    reduction_group = debug_api.get_tensor_reduction_group()
     reduce_within_microbatch = tensor_name.lower() != "weight"
 
     if tensor_name.lower() == "weight":
@@ -42,6 +41,9 @@ def get_reduction_params(
             reduction_group = tp_group
         else:
             skip_reduction = True
+            reduction_group = None
+    else:
+        reduction_group = debug_api.get_tensor_reduction_group()
 
     return skip_reduction, reduction_group, reduce_within_microbatch
 
