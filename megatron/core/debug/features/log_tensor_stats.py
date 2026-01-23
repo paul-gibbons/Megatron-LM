@@ -24,7 +24,6 @@ from nvdlfw_inspect.registry import Registry, api_method
 
 from megatron.core.debug.features.api import MCoreConfigAPIMapper
 from megatron.core.debug.features.utils.stats_buffer import MCORE_STATS_BUFFERS
-from megatron.core.debug.utils import compute_next_enabled_iter
 
 
 @Registry.register_feature(namespace="megatron_core")
@@ -58,16 +57,6 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
             "entropy", "per_element", "per_element%",
             "num_zeros", "num_zeros%",
         }
-
-    def _check_log_frequency(self, config: Dict, iteration: int) -> Tuple[bool, Optional[int]]:
-        freq = config.get("freq", 1)
-        start_step = config.get("start_step", 0)
-        end_step = config.get("end_step", -1)
-        start_end_list = config.get("start_end_list", None)
-
-        return compute_next_enabled_iter(
-            start_step, end_step, start_end_list, freq, iteration
-        )
 
     @api_method
     def inspect_tensor_enabled(

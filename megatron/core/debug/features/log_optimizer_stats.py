@@ -21,7 +21,6 @@ from nvdlfw_inspect.registry import Registry, api_method
 
 from megatron.core.debug.features.api import MCoreConfigAPIMapper
 from megatron.core.debug.features.utils.optimizer_stats_buffer import OPTIMIZER_STATS_BUFFERS
-from megatron.core.debug.utils import compute_next_enabled_iter
 
 
 @Registry.register_feature(namespace="megatron_core")
@@ -39,15 +38,6 @@ class LogOptimizerStats(MCoreConfigAPIMapper):
         "exp_avg_norm", "exp_avg_sq_mean", "grad_to_v_ratio", "rms_staleness", "update_norm",
         "momentum_norm",  # Muon optimizer
     }
-
-    def _check_log_frequency(self, config: Dict, iteration: int) -> Tuple[bool, Optional[int]]:
-        return compute_next_enabled_iter(
-            config.get("start_step", 0),
-            config.get("end_step", -1),
-            config.get("start_end_list"),
-            config.get("freq", 1),
-            iteration,
-        )
 
     def _validate_stats(self, stats: list) -> None:
         from megatron.core.debug.features.utils.stats_buffer import parse_num_zeros_stat

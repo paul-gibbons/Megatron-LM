@@ -25,10 +25,21 @@ from nvdlfw_inspect.registry import Registry
 from megatron.core.debug.debug_state import MCoreDebugState
 from megatron.core.debug.features.utils.stats_buffer import MCORE_STATS_BUFFERS
 from megatron.core.debug.features.utils.optimizer_stats_buffer import OPTIMIZER_STATS_BUFFERS
+from megatron.core.debug.utils import compute_next_enabled_iter
 
 
 class MCoreConfigAPIMapper(BaseConfigAPIMapper):
     """Config API mapper for Megatron-Core features."""
+
+    def _check_log_frequency(self, config: Dict, iteration: int) -> Tuple[bool, Optional[int]]:
+        """Check if logging is enabled based on config scheduling (start_step, end_step, freq)."""
+        return compute_next_enabled_iter(
+            config.get("start_step", 0),
+            config.get("end_step", -1),
+            config.get("start_end_list"),
+            config.get("freq", 1),
+            iteration,
+        )
 
     def parse_config_and_api(self, config, **kwargs):
         """Process config and return True if config matches API args."""
