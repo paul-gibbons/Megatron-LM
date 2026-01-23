@@ -264,17 +264,19 @@ class MegatronOptimizer(ABC):
         )
 
         for param_group in self.param_groups:
-            params = param_group.get('params', [])
-
-            for param in params:
+            for param in param_group.get('params', []):
                 name = self._param_names.get(id(param))
                 if name is None:
                     continue
 
+                model_param = getattr(param, 'model_param', param)
+
                 if use_decoupled_grad:
-                    grad = getattr(param, 'decoupled_grad', None)
+                    grad = getattr(model_param, 'decoupled_grad', None)
                 else:
-                    grad = param.grad
+                    grad = getattr(model_param, 'main_grad', None)
+                    if grad is None:
+                        grad = model_param.grad
 
                 optimizer_state = self.optimizer.state.get(param, {}) if self.optimizer else {}
 
@@ -742,13 +744,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
-                            # Store handle to main_param.
                             param.main_param = main_param
+                            main_param.model_param = param
 
                             fp32_from_float16_params_this_group.append(main_param)
                             # Reset existing state dict key to the new main param.
                             if param in self.optimizer.state:
                                 self.optimizer.state[main_param] = self.optimizer.state.pop(param)
+
                         # fp32 params.
                         elif param.type() == 'torch.cuda.FloatTensor':
                             fp32_params_this_group.append(param)
@@ -840,6 +843,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         _multi_tensor_copy_this_to_that(
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
         )
+
+    def get_main_param_and_optimizer_states(self, model_param):
+        """Return the main param and optimizer state dict for model_param."""
+        main_param = getattr(model_param, 'main_param', model_param)
+        optim_state = self.optimizer.state[main_param]
+        return {"param": main_param, **optim_state}
 
     def _copy_model_params_to_main_params(self, state_dict=None):
         assert state_dict is None, "Initialize main params from state dict is not supported"
@@ -1421,7 +1430,6 @@ class ChainedOptimizer(MegatronOptimizer):
 
         update_successful = self.step_with_ready_grads()
 
-        # Log optimizer stats if debug is enabled
         if MCoreDebugState.debug_enabled:
             self.log_optimizer_stats(MCoreDebugState.get_iteration())
 

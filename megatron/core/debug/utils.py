@@ -365,6 +365,18 @@ def is_optim_debug_iter(optimizer: torch.optim.Optimizer) -> bool:
     return state.update_for_iteration(MCoreDebugState.get_iteration())
 
 
+def _infer_optimizer_type(optimizer: torch.optim.Optimizer) -> Optional[str]:
+    """Infer optimizer type from class name for logging."""
+    opt_class = type(optimizer).__name__.lower()
+    if "muon" in opt_class:
+        return "muon"
+    if "adam" in opt_class or "fusedadam" in opt_class:
+        return "adam"
+    if "sgd" in opt_class:
+        return "sgd"
+    return None
+
+
 def inspect_optimizer_param(
     optimizer: torch.optim.Optimizer,
     param_name: str,
@@ -374,6 +386,7 @@ def inspect_optimizer_param(
     iteration: int,
     reduction_group: Optional[torch.distributed.ProcessGroup] = None,
     is_distributed_optimizer: bool = False,
+    optimizer_type: Optional[str] = None,
 ) -> None:
     """Inspect a parameter and collect optimizer statistics.
 
@@ -386,8 +399,14 @@ def inspect_optimizer_param(
         iteration: Current iteration number.
         reduction_group: Optional process group for reduction.
         is_distributed_optimizer: Whether this is a distributed optimizer.
+        optimizer_type: Optional optimizer type name (e.g., "muon", "adam").
+            If None, will be inferred from optimizer class name.
     """
     import nvdlfw_inspect.api as debug_api
+
+    # Auto-detect optimizer type if not provided
+    if optimizer_type is None:
+        optimizer_type = _infer_optimizer_type(optimizer)
 
     state = TensorInspectRegistry.get_optim_state(id(optimizer))
 
@@ -413,6 +432,7 @@ def inspect_optimizer_param(
             iteration=iteration,
             reduction_group=reduction_group,
             is_distributed_optimizer=is_distributed_optimizer,
+            optimizer_type=optimizer_type,
         )
 
 

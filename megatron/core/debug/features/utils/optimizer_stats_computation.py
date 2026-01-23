@@ -29,6 +29,7 @@ STAT_INDICES = {
     "exp_avg_norm_sq": 4,
     "exp_avg_sq_sum": 5,
     "update_norm_sq": 6,
+    "momentum_norm_sq": 7,  # Muon optimizer momentum buffer
 }
 NUM_BUFFER_STATS = len(STAT_INDICES)
 
@@ -46,13 +47,14 @@ def compute_buffer_stats(
 
     buffer[STAT_INDICES["numel"]] = float(param.numel())
 
+    if "param_norm" in requested or "weight_grad_ratio" in requested:
+        buffer[STAT_INDICES["param_norm_sq"]] = (param.float() ** 2).sum().item()
+
     if grad is not None:
         grad_f = grad.float()
 
         if "grad_norm" in requested or "grad_rms" in requested or "weight_grad_ratio" in requested:
             buffer[STAT_INDICES["grad_norm_sq"]] = (grad_f ** 2).sum().item()
-        if "weight_grad_ratio" in requested:
-            buffer[STAT_INDICES["param_norm_sq"]] = (param.float() ** 2).sum().item()
 
         exp_avg_sq = optimizer_state.get("exp_avg_sq")
         if exp_avg_sq is not None and requested & {"rms_staleness", "grad_to_v_ratio"}:
@@ -60,6 +62,7 @@ def compute_buffer_stats(
 
     exp_avg = optimizer_state.get("exp_avg")
     exp_avg_sq = optimizer_state.get("exp_avg_sq")
+    momentum_buffer = optimizer_state.get("momentum_buffer")  # Muon optimizer
 
     if exp_avg is not None and "exp_avg_norm" in requested:
         buffer[STAT_INDICES["exp_avg_norm_sq"]] = (exp_avg.float() ** 2).sum().item()
@@ -68,6 +71,8 @@ def compute_buffer_stats(
     if exp_avg is not None and exp_avg_sq is not None and "update_norm" in requested:
         update = exp_avg.float() / (exp_avg_sq.float().sqrt() + eps)
         buffer[STAT_INDICES["update_norm_sq"]] = (update ** 2).sum().item()
+    if momentum_buffer is not None and "momentum_norm" in requested:
+        buffer[STAT_INDICES["momentum_norm_sq"]] = (momentum_buffer.float() ** 2).sum().item()
 
     return buffer
 
@@ -87,6 +92,8 @@ def compute_final_stats(buffer: torch.Tensor, stats: List[str]) -> Dict[str, flo
             results["grad_norm"] = buffer[STAT_INDICES["grad_norm_sq"]].item() ** 0.5
         elif s == "grad_rms":
             results["grad_rms"] = (buffer[STAT_INDICES["grad_norm_sq"]].item() / numel) ** 0.5
+        elif s == "param_norm":
+            results["param_norm"] = buffer[STAT_INDICES["param_norm_sq"]].item() ** 0.5
         elif s == "weight_grad_ratio":
             g = buffer[STAT_INDICES["grad_norm_sq"]].item() ** 0.5
             results["weight_grad_ratio"] = buffer[STAT_INDICES["param_norm_sq"]].item() ** 0.5 / g if g > 0 else float('inf')
@@ -98,5 +105,7 @@ def compute_final_stats(buffer: torch.Tensor, stats: List[str]) -> Dict[str, flo
             results["exp_avg_sq_mean"] = buffer[STAT_INDICES["exp_avg_sq_sum"]].item() / numel
         elif s == "update_norm":
             results["update_norm"] = buffer[STAT_INDICES["update_norm_sq"]].item() ** 0.5
+        elif s == "momentum_norm":
+            results["momentum_norm"] = buffer[STAT_INDICES["momentum_norm_sq"]].item() ** 0.5
 
     return results

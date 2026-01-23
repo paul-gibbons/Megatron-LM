@@ -114,11 +114,13 @@ def extract_layer_key(param_name: str, aggregate_by: str) -> Optional[str]:
 class _OptimizerStatsBuffer:
     """Buffer for one optimizer parameter."""
 
-    def __init__(self, param_name: str, stats: List[str], reduction_group, aggregate_by: Optional[str]):
+    def __init__(self, param_name: str, stats: List[str], reduction_group,
+                 aggregate_by: Optional[str], optimizer_type: Optional[str] = None):
         self.param_name = param_name
         self.stats = stats
         self.reduction_group = reduction_group
         self.aggregate_by = aggregate_by
+        self.optimizer_type = optimizer_type
 
         self._buffer = torch.zeros(NUM_BUFFER_STATS, dtype=torch.float64, device="cuda")
         self.modified = torch.tensor([False], dtype=torch.bool, device="cuda")
@@ -158,11 +160,13 @@ class _OptimizerStatsBuffer:
     ) -> Dict[Tuple, float]:
         """Log stats with synchronized all_reduce (all ranks participate even if unmodified)."""
         output = {}
-        name_prefix = (
+        layer_key = (
             extract_layer_key(self.param_name, self.aggregate_by)
             if self.aggregate_by
             else self.param_name
         )
+        # Include optimizer type in prefix if available
+        name_prefix = f"{self.optimizer_type}_{layer_key}" if self.optimizer_type else layer_key
 
         if self.modified[0]:
             buffer_to_reduce = self._buffer.clone()
@@ -258,10 +262,11 @@ class OptimizerStatsBuffers:
             self.default_reduction_group = reduction_group
 
     def try_add_buffer(self, param_name: str, stats: List[str],
-                       reduction_group, aggregate_by: Optional[str] = None):
+                       reduction_group, aggregate_by: Optional[str] = None,
+                       optimizer_type: Optional[str] = None):
         if param_name in self.buffers:
             return
-        buffer = _OptimizerStatsBuffer(param_name, stats, reduction_group, aggregate_by)
+        buffer = _OptimizerStatsBuffer(param_name, stats, reduction_group, aggregate_by, optimizer_type)
         self.buffers[param_name] = buffer
         self.reduction_group_to_buffers[reduction_group].append(buffer)
         if aggregate_by:
@@ -269,10 +274,11 @@ class OptimizerStatsBuffers:
 
     def feed(self, param_name: str, param: torch.Tensor, grad: Optional[torch.Tensor],
              optimizer_state: Dict, stats: List[str], iteration: int,
-             reduction_group=None, aggregate_by: Optional[str] = None):
+             reduction_group=None, aggregate_by: Optional[str] = None,
+             optimizer_type: Optional[str] = None):
         self.at_least_one_fed = True
         self.set_default_reduction_group(reduction_group)
-        self.try_add_buffer(param_name, stats, reduction_group, aggregate_by)
+        self.try_add_buffer(param_name, stats, reduction_group, aggregate_by, optimizer_type)
         self.buffers[param_name].feed(param, grad, optimizer_state, iteration)
 
     def _get_reduction_group(self) -> Optional[torch.distributed.ProcessGroup]:
@@ -361,10 +367,14 @@ class OptimizerStatsBuffers:
         if reduction_group is None:
             reduction_group = self._get_reduction_group()
 
+        # Group by (optimizer_type, layer_key) to separate muon/adam stats
         local_grouped: Dict[str, List[_OptimizerStatsBuffer]] = defaultdict(list)
         for buffer in self.buffers.values():
-            key = extract_layer_key(buffer.param_name, self.aggregate_by) or "unknown"
-            local_grouped[key].append(buffer)
+            layer_key = extract_layer_key(buffer.param_name, self.aggregate_by) or "unknown"
+            # Create composite key including optimizer type
+            opt_prefix = f"{buffer.optimizer_type}_" if buffer.optimizer_type else ""
+            composite_key = f"{opt_prefix}{layer_key}"
+            local_grouped[composite_key].append(buffer)
 
         local_layer_keys = set(local_grouped.keys())
         all_layer_keys = _synchronize_param_names(local_layer_keys, reduction_group)
@@ -383,13 +393,13 @@ class OptimizerStatsBuffers:
         thresholds = _synchronize_num_zeros_thresholds(all_thresholds, reduction_group)
 
         output = {}
-        for layer_key in all_layer_keys:
+        for composite_key in all_layer_keys:
             combined = torch.zeros(NUM_BUFFER_STATS, dtype=torch.float64, device="cuda")
             combined_num_zeros: Dict[float, float] = {}
             combined_num_zeros_numel = 0
 
-            if layer_key in local_grouped:
-                for buffer in local_grouped[layer_key]:
+            if composite_key in local_grouped:
+                for buffer in local_grouped[composite_key]:
                     if buffer.modified[0]:
                         combined += buffer._buffer
                         nz_dict, nz_numel = buffer.get_num_zeros_data()
@@ -430,15 +440,15 @@ class OptimizerStatsBuffers:
                     else:
                         value = count
                         stat_name = f"num_zeros{threshold_str}"
-                    metric_name = f"optimizer_{layer_key}_{stat_name}"
+                    metric_name = f"optimizer_{composite_key}_{stat_name}"
                     MetricLogger.log_scalar(metric_name, value, iteration)
-                    output[(layer_key, stat_name, iteration)] = value
+                    output[(composite_key, stat_name, iteration)] = value
 
             final = compute_final_stats(combined, stats)
             for stat_name, value in final.items():
-                metric_name = f"optimizer_{layer_key}_{stat_name}"
+                metric_name = f"optimizer_{composite_key}_{stat_name}"
                 MetricLogger.log_scalar(metric_name, value, iteration)
-                output[(layer_key, stat_name, iteration)] = value
+                output[(composite_key, stat_name, iteration)] = value
 
         self.at_least_one_fed = False
         return output

@@ -29,13 +29,15 @@ class LogOptimizerStats(MCoreConfigAPIMapper):
     """Log optimizer statistics per parameter or aggregated by layer.
 
     Supported stats:
-        num_zeros, num_zeros%, num_zeros[threshold]%, grad_norm, grad_rms,
-        weight_grad_ratio, exp_avg_norm, exp_avg_sq_mean, rms_staleness, update_norm
+        num_zeros, num_zeros%, num_zeros[threshold]%, grad_norm, grad_rms, param_norm,
+        weight_grad_ratio, exp_avg_norm, exp_avg_sq_mean, rms_staleness, update_norm,
+        momentum_norm (for Muon optimizer)
     """
 
     _SUPPORTED_STATS = {
-        "num_zeros", "num_zeros%", "grad_norm", "grad_rms", "weight_grad_ratio",
+        "num_zeros", "num_zeros%", "grad_norm", "grad_rms", "param_norm", "weight_grad_ratio",
         "exp_avg_norm", "exp_avg_sq_mean", "grad_to_v_ratio", "rms_staleness", "update_norm",
+        "momentum_norm",  # Muon optimizer
     }
 
     def _check_log_frequency(self, config: Dict, iteration: int) -> Tuple[bool, Optional[int]]:
@@ -66,6 +68,7 @@ class LogOptimizerStats(MCoreConfigAPIMapper):
         param_name = kwargs.get("param_name", layer_name)
         grad = kwargs.get("grad")
         optimizer_state = kwargs.get("optimizer_state", {})
+        optimizer_type = kwargs.get("optimizer_type")
         stats = config.get("stats", ["num_zeros%", "grad_norm"])
 
         should_run, _ = self._check_log_frequency(config, iteration)
@@ -83,4 +86,5 @@ class LogOptimizerStats(MCoreConfigAPIMapper):
             iteration=iteration,
             reduction_group=kwargs.get("reduction_group"),
             aggregate_by=config.get("aggregate_by"),
+            optimizer_type=optimizer_type,
         )
