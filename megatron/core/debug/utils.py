@@ -18,12 +18,61 @@ This module provides standalone functions for tensor and optimizer inspection
 without requiring mixin inheritance in model classes.
 """
 
+import fnmatch
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 
 from megatron.core.debug.debug_state import MCoreDebugState
+
+
+def _get_linear_types() -> tuple:
+    """Build tuple of linear layer types to capture gradients from."""
+    types: List[type] = [nn.Linear, nn.Embedding]
+
+    try:
+        from megatron.core.tensor_parallel.layers import (
+            ColumnParallelLinear,
+            RowParallelLinear,
+        )
+        types.extend([ColumnParallelLinear, RowParallelLinear])
+    except ImportError:
+        pass
+
+    try:
+        from megatron.core.extensions.transformer_engine import (
+            TELinear,
+            TEColumnParallelLinear,
+            TERowParallelLinear,
+            TELayerNormColumnParallelLinear,
+        )
+        types.extend([
+            TELinear, TEColumnParallelLinear, TERowParallelLinear,
+            TELayerNormColumnParallelLinear
+        ])
+    except ImportError:
+        pass
+
+    try:
+        from megatron.core.extensions.transformer_engine import (
+            TEGroupedLinear,
+            TEColumnParallelGroupedLinear,
+            TERowParallelGroupedLinear,
+        )
+        if TEGroupedLinear is not None:
+            types.extend([
+                TEGroupedLinear, TEColumnParallelGroupedLinear,
+                TERowParallelGroupedLinear
+            ])
+    except ImportError:
+        pass
+
+    return tuple(types)
+
+
+LINEAR_TYPES = _get_linear_types()
 
 
 def get_reduction_params(
@@ -46,11 +95,6 @@ def get_reduction_params(
         reduction_group = debug_api.get_tensor_reduction_group()
 
     return skip_reduction, reduction_group, reduce_within_microbatch
-
-
-# ---------------------------------------------------------------------------
-# Registry for per-layer and per-optimizer debug state
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -122,11 +166,6 @@ class TensorInspectRegistry:
             state.backward_hook_handles.clear()
         cls._layer_state.clear()
         cls._optim_state.clear()
-
-
-# ---------------------------------------------------------------------------
-# Standalone functions for tensor inspection
-# ---------------------------------------------------------------------------
 
 
 def is_debug_iter(layer_name: str) -> bool:
@@ -315,6 +354,65 @@ def remove_backward_hooks(layer_name: str) -> None:
     state.backward_hook_handles.clear()
 
 
+def _unwrap_model(model: Any) -> Any:
+    """Unwrap a model from DDP/FSDP wrappers."""
+    unwrapped = model
+    while hasattr(unwrapped, "module"):
+        unwrapped = unwrapped.module
+    return unwrapped
+
+
+def _matches_layer_pattern(name: str, patterns: Optional[List[str]]) -> bool:
+    """Return True if name matches any pattern."""
+    if not patterns or "*" in patterns:
+        return True
+    return any(fnmatch.fnmatch(name, p) or p == "*" for p in patterns)
+
+
+def register_global_backward_hooks(
+    model: Any,
+    hook_factory: Callable[[str], Callable],
+    layer_patterns: Optional[List[str]] = None,
+    module_types: Optional[tuple] = None,
+) -> List[torch.utils.hooks.RemovableHandle]:
+    """Register backward hooks on matching modules.
+
+    Args:
+        model: The model or list of model chunks to register hooks on.
+        hook_factory: Callable that takes layer_name and returns a hook function.
+        layer_patterns: Optional list of glob patterns to filter layers.
+        module_types: Optional tuple of module types to register hooks on.
+
+    Returns:
+        List of hook handles that can be used to remove the hooks later.
+    """
+    if module_types is None:
+        module_types = LINEAR_TYPES
+
+    handles: List[torch.utils.hooks.RemovableHandle] = []
+    model_chunks = model if isinstance(model, (list, tuple)) else [model]
+
+    for chunk_id, model_chunk in enumerate(model_chunks):
+        unwrapped = _unwrap_model(model_chunk)
+
+        for module_name, module in unwrapped.named_modules():
+            if isinstance(module, module_types):
+                if _matches_layer_pattern(module_name, layer_patterns):
+                    layer_name = f"model_chunk{chunk_id}__{module_name}"
+                    hook_fn = hook_factory(layer_name)
+                    handle = module.register_full_backward_hook(hook_fn)
+                    handles.append(handle)
+
+    return handles
+
+
+def remove_hook_handles(handles: List[torch.utils.hooks.RemovableHandle]) -> None:
+    """Remove a list of hook handles and clear the list."""
+    for handle in handles:
+        handle.remove()
+    handles.clear()
+
+
 def manage_backward_hooks(
     layer_name: str,
     gradient_targets: Dict[str, torch.nn.Module],
@@ -343,11 +441,6 @@ def manage_backward_hooks(
             setup_backward_hooks(layer_name, gradient_targets, reduction_group)
         elif not enabled and state.backward_hook_handles:
             remove_backward_hooks(layer_name)
-
-
-# ---------------------------------------------------------------------------
-# Standalone functions for optimizer inspection
-# ---------------------------------------------------------------------------
 
 
 def is_optim_debug_iter(optimizer: torch.optim.Optimizer) -> bool:
@@ -436,11 +529,6 @@ def inspect_optimizer_param(
             is_distributed_optimizer=is_distributed_optimizer,
             optimizer_type=optimizer_type,
         )
-
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
 
 
 def _update_next_debug_iter(

@@ -25,6 +25,7 @@ from nvdlfw_inspect.registry import Registry
 from megatron.core.debug.debug_state import MCoreDebugState
 from megatron.core.debug.features.utils.stats_buffer import MCORE_STATS_BUFFERS
 from megatron.core.debug.features.utils.optimizer_stats_buffer import OPTIMIZER_STATS_BUFFERS
+from megatron.core.debug.features.utils.tensor_dump import TENSOR_DUMP_STATE, save_tensor_dump
 from megatron.core.debug.utils import compute_next_enabled_iter
 
 
@@ -184,12 +185,24 @@ class MegatronCoreAPI(BaseNamespaceAPI):
         )
 
     def step(self):
+        from megatron.core.debug.features.utils.dgrad_logger import save_dgrads
+
         current_iter = MCoreDebugState.get_iteration()
         MCORE_STATS_BUFFERS.log_stats(current_iter)
         OPTIMIZER_STATS_BUFFERS.log_stats(current_iter)
 
+        if TENSOR_DUMP_STATE.has_data() and TENSOR_DUMP_STATE.save_dir:
+            save_tensor_dump(TENSOR_DUMP_STATE.save_dir, current_iter)
+
+        save_dgrads()
+
     def end_debug(self):
+        from megatron.core.debug.features.utils.dgrad_logger import DGRAD_LOGGER
+
         MCORE_STATS_BUFFERS.reset()
         OPTIMIZER_STATS_BUFFERS.reset()
+        TENSOR_DUMP_STATE.reset()
+        DGRAD_LOGGER.reset()
+        DGRAD_LOGGER.disable()
         MCoreDebugState._reset()
 

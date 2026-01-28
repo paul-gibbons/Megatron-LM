@@ -138,6 +138,11 @@ def initialize_tensor_inspect_pre_model(
     print_rank_0("Initialized NVIDIA DLFw Inspect.")
 
 
+def _maybe_register_dgrad_hooks(model: List[Any]) -> None:
+    from megatron.core.debug.features.utils.dgrad_logger import register_dgrad_hooks
+    register_dgrad_hooks(model, layer_patterns=["*"])
+
+
 def finalize_tensor_inspect_post_model(
     enabled: bool,
     model: List[Any],
@@ -165,6 +170,7 @@ def finalize_tensor_inspect_post_model(
         with_context_parallel=include_context_parallel
     )
     nvinspect_api.set_tensor_reduction_group(reduction_group)
+    _maybe_register_dgrad_hooks(model)
     print_rank_0("Finalized NVIDIA DLFw Inspect.")
 
 
@@ -181,5 +187,8 @@ def tensor_inspect_step(enabled: bool) -> None:
 def tensor_inspect_end(enabled: bool) -> None:
     if not enabled or not HAVE_NVINSPECT:
         return
+
+    from megatron.core.debug.features.utils.dgrad_logger import remove_dgrad_hooks
+    remove_dgrad_hooks()
 
     nvinspect_api.end_debug()

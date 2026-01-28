@@ -13,3 +13,26 @@
 # limitations under the License.
 
 """MCore debug features for nvdlfw_inspect integration."""
+
+
+def __getattr__(name):
+    """Lazy import of gradient dumping functions."""
+    if name in (
+        "register_dgrad_hooks",
+        "remove_dgrad_hooks",
+        "save_dgrads",
+        "enable_dgrad_capture",
+        "disable_dgrad_capture",
+    ):
+        from megatron.core.debug.features import dump_gradients
+        return getattr(dump_gradients, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "register_dgrad_hooks",
+    "remove_dgrad_hooks",
+    "save_dgrads",
+    "enable_dgrad_capture",
+    "disable_dgrad_capture",
+]
