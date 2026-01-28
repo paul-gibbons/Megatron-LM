@@ -1,0 +1,33 @@
+# FP8 Per-Tensor (Tensorwise/Current Scaling) Statistics Collection
+# Use with: --tensor-inspect --tensor-inspect-config <this_file>
+
+fp8_tensor_stat_collection:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: ".*"
+  transformer_engine:
+    LogFp8TensorStats:
+      enabled: True
+      tensors:
+        - gradient
+        - activation
+        - weight
+      stats:
+        - "underflows%"
+      freq: 5
+      start_step: 1
+      end_step: 10000
+    LogTensorStats:
+      enabled: True
+      tensors:
+        - wgrad
+        - dgrad
+      stats:
+        - "min"
+        - "max"
+        - "mean"
+        - "dynamic_range"
+      freq: 5
+      start_step: 1
+      end_step: 10000
+

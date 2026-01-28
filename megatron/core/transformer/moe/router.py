@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from megatron.core.debug.utils import inspect_tensor, manage_backward_hooks
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
@@ -503,8 +504,13 @@ class TopKRouter(Router):
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
         """
+        layer_num = self.layer_number if self.layer_number is not None else 0
+        layer_name = f"decoder.layers.{layer_num}.mlp.router"
+
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
+
+        inspect_tensor(layer_name, "router_logits", logits, reduction_group=self.tp_cp_group)
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
@@ -525,6 +531,9 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
             )
 
+        inspect_tensor(layer_name, "router_probs", probs, reduction_group=self.tp_cp_group)
+        inspect_tensor(layer_name, "routing_map", routing_map.float(), reduction_group=self.tp_cp_group)
+
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
@@ -542,6 +551,9 @@ class TopKRouter(Router):
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
             )
+
+            inspect_tensor(layer_name, "routing_scores", scores_for_aux_loss, reduction_group=self.tp_cp_group)
+
             probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
             probs = self._apply_seq_aux_loss(
                 probs, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz
@@ -550,8 +562,10 @@ class TopKRouter(Router):
                 probs, scores_for_aux_loss, routing_map_for_aux_loss
             )
 
-        # Optionally apply expert bias
         self._apply_expert_bias(routing_map)
+
+        tokens_per_expert = routing_map.sum(dim=0).float()
+        inspect_tensor(layer_name, "tokens_per_expert", tokens_per_expert, reduction_group=self.tp_cp_group)
 
         return probs, routing_map
 
@@ -569,6 +583,13 @@ class TopKRouter(Router):
             input (torch.Tensor): Input tensor.
         """
         self._maintain_float32_expert_bias()
+
+        layer_num = self.layer_number if self.layer_number is not None else 0
+        layer_name = f"decoder.layers.{layer_num}.mlp.router"
+        gradient_targets = {"wgrad": self, "dgrad": self}
+        manage_backward_hooks(layer_name, gradient_targets, reduction_group=self.tp_cp_group)
+
+        inspect_tensor(layer_name, "router_weight", self.weight, reduction_group=self.tp_cp_group)
 
         # Apply input jitter
         input = self.apply_input_jitter(input)

@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.debug.utils import inspect_tensor, manage_backward_hooks
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, nvtx_decorator
@@ -108,9 +109,16 @@ class LanguageModelEmbedding(MegatronModule):
         Returns:
             Tensor: The output embeddings
         """
+        layer_name = "embedding"
+        gradient_targets = {"wgrad": self.word_embeddings, "dgrad": self}
+        manage_backward_hooks(layer_name, gradient_targets, reduction_group=self.tp_group)
+
         word_embeddings = self.word_embeddings(input_ids)
+        inspect_tensor(layer_name, "word", word_embeddings, reduction_group=self.tp_group)
+
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
+            inspect_tensor(layer_name, "position", position_embeddings, reduction_group=self.tp_group)
             embeddings = word_embeddings + position_embeddings
         else:
             embeddings = word_embeddings
@@ -123,9 +131,12 @@ class LanguageModelEmbedding(MegatronModule):
             assert self.tokentype_embeddings is not None
             # [b s h] -> [s b h] (So that it can be added with embeddings)
             tokentype_embedding = self.tokentype_embeddings(tokentype_ids).permute(1, 0, 2)
+            inspect_tensor(layer_name, "tokentype", tokentype_embedding, reduction_group=self.tp_group)
             embeddings = embeddings + tokentype_embedding
         else:
             assert self.tokentype_embeddings is None
+
+        inspect_tensor(layer_name, "output", embeddings, reduction_group=self.tp_group)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:

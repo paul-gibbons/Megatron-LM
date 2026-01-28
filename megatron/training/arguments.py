@@ -2090,6 +2090,15 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
+    group.add_argument('--tensor-inspect', action='store_true',
+                       help='Enable tensor inspection via NVIDIA DLFw Inspect.')
+    group.add_argument('--tensor-inspect-config', type=str, default=None,
+                       help='Path to YAML config for tensor inspection features.')
+    group.add_argument('--tensor-inspect-log-dir', type=str, default=None,
+                       help='Directory for tensor inspection logs.')
+    group.add_argument('--tensor-inspect-feature-dirs', type=str, nargs='+', default=None,
+                       help='Directories containing tensor inspection feature implementations.')
+
     return parser
 
 
