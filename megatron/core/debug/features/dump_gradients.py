@@ -105,6 +105,7 @@ class DumpWGrads(MCoreConfigAPIMapper):
         is_distributed_optimizer = kwargs.get("is_distributed_optimizer", False)
         reduction_group = kwargs.get("reduction_group")
         is_expert_parallel = kwargs.get("is_expert_parallel", False)
+        skip_expert_all_gather = config.get("skip_expert_all_gather", False)
         effective_group = reduction_group
         if is_expert_parallel:
             try:
@@ -113,7 +114,10 @@ class DumpWGrads(MCoreConfigAPIMapper):
             except (AssertionError, RuntimeError):
                 effective_group = reduction_group
 
-        if is_distributed_optimizer and effective_group is not None:
+        if is_expert_parallel and skip_expert_all_gather:
+            # Save local shard to avoid large all_gather for expert-parallel weights.
+            full_grad = grad
+        elif is_distributed_optimizer and effective_group is not None:
             world_size = torch.distributed.get_world_size(effective_group)
             if world_size > 1:
                 gathered_grads = [torch.empty_like(grad) for _ in range(world_size)]
