@@ -482,6 +482,7 @@ def inspect_optimizer_param(
     reduction_group: Optional[torch.distributed.ProcessGroup] = None,
     is_distributed_optimizer: bool = False,
     optimizer_type: Optional[str] = None,
+    is_expert_parallel: Optional[bool] = None,
 ) -> None:
     """Inspect a parameter and collect optimizer statistics.
 
@@ -496,6 +497,7 @@ def inspect_optimizer_param(
         is_distributed_optimizer: Whether this is a distributed optimizer.
         optimizer_type: Optional optimizer type name (e.g., "muon", "adam").
             If None, will be inferred from optimizer class name.
+        is_expert_parallel: Whether the parameter is expert-parallel.
     """
     import nvdlfw_inspect.api as debug_api
 
@@ -509,6 +511,7 @@ def inspect_optimizer_param(
         layer_name=param_name,
         param_name=param_name,
         iteration=iteration,
+        is_expert_parallel=is_expert_parallel,
     )
 
     if isinstance(result, tuple):
@@ -528,6 +531,7 @@ def inspect_optimizer_param(
             reduction_group=reduction_group,
             is_distributed_optimizer=is_distributed_optimizer,
             optimizer_type=optimizer_type,
+            is_expert_parallel=is_expert_parallel,
         )
 
 

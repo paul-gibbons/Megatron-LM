@@ -264,6 +264,7 @@ class MegatronOptimizer(ABC):
         )
 
         for param_group in self.param_groups:
+            is_expert_parallel = param_group.get("is_expert_parallel", False)
             for param in param_group.get('params', []):
                 name = self._param_names.get(id(param))
                 if name is None:
@@ -289,6 +290,7 @@ class MegatronOptimizer(ABC):
                     iteration=iteration,
                     reduction_group=self.get_grad_stats_parallel_group(),
                     is_distributed_optimizer=is_distributed_optimizer,
+                    is_expert_parallel=is_expert_parallel,
                 )
 
     @abstractmethod

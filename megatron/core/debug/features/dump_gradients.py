@@ -104,12 +104,20 @@ class DumpWGrads(MCoreConfigAPIMapper):
         save_dir = config.get("save_dir")
         is_distributed_optimizer = kwargs.get("is_distributed_optimizer", False)
         reduction_group = kwargs.get("reduction_group")
+        is_expert_parallel = kwargs.get("is_expert_parallel", False)
+        effective_group = reduction_group
+        if is_expert_parallel:
+            try:
+                from megatron.core import parallel_state as mpu
+                effective_group = mpu.get_expert_data_parallel_group()
+            except (AssertionError, RuntimeError):
+                effective_group = reduction_group
 
-        if is_distributed_optimizer and reduction_group is not None:
-            world_size = torch.distributed.get_world_size(reduction_group)
+        if is_distributed_optimizer and effective_group is not None:
+            world_size = torch.distributed.get_world_size(effective_group)
             if world_size > 1:
                 gathered_grads = [torch.empty_like(grad) for _ in range(world_size)]
-                torch.distributed.all_gather(gathered_grads, grad, group=reduction_group)
+                torch.distributed.all_gather(gathered_grads, grad, group=effective_group)
                 full_grad = torch.cat(gathered_grads, dim=0)
             else:
                 full_grad = grad
