@@ -443,6 +443,9 @@ def manage_backward_hooks(
             remove_backward_hooks(layer_name)
 
 
+_IS_OPTIM_DEBUG_ITER_LOGGED = {}  # Track logging per iteration
+
+
 def is_optim_debug_iter(optimizer: torch.optim.Optimizer) -> bool:
     """Check if this iteration should run optimizer debug inspection.
 
@@ -452,12 +455,43 @@ def is_optim_debug_iter(optimizer: torch.optim.Optimizer) -> bool:
     Returns:
         True if optimizer debug inspection should run this iteration.
     """
+    import logging
+    _logger = logging.getLogger(__name__)
+
     MCoreDebugState.ensure_initialized()
+
+    current_iter = MCoreDebugState.get_iteration()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    # Debug log once per iteration
+    should_log = current_iter not in _IS_OPTIM_DEBUG_ITER_LOGGED
+    if should_log:
+        _IS_OPTIM_DEBUG_ITER_LOGGED[current_iter] = True
+        # Keep dict from growing unbounded
+        if len(_IS_OPTIM_DEBUG_ITER_LOGGED) > 100:
+            old_keys = sorted(_IS_OPTIM_DEBUG_ITER_LOGGED.keys())[:-50]
+            for k in old_keys:
+                del _IS_OPTIM_DEBUG_ITER_LOGGED[k]
+
     if not MCoreDebugState.debug_enabled:
+        if should_log:
+            _logger.info(
+                f"[is_optim_debug_iter DEBUG] rank={rank} iter={current_iter} "
+                f"SKIP - debug_enabled=False"
+            )
         return False
 
     state = TensorInspectRegistry.get_optim_state(id(optimizer))
-    return state.update_for_iteration(MCoreDebugState.get_iteration())
+    result = state.update_for_iteration(current_iter)
+
+    if should_log:
+        _logger.info(
+            f"[is_optim_debug_iter DEBUG] rank={rank} iter={current_iter} "
+            f"result={result} next_debug_iter={state.next_debug_iter} "
+            f"enabled_this_iter={state.enabled_this_iter}"
+        )
+
+    return result
 
 
 def _infer_optimizer_type(optimizer: torch.optim.Optimizer) -> Optional[str]:
@@ -470,6 +504,9 @@ def _infer_optimizer_type(optimizer: torch.optim.Optimizer) -> Optional[str]:
     if "sgd" in opt_class:
         return "sgd"
     return None
+
+
+_INSPECT_OPT_PARAM_DEBUG_LOGGED_ITER = -1  # Module-level tracker for debug logging
 
 
 def inspect_optimizer_param(
@@ -499,7 +536,32 @@ def inspect_optimizer_param(
             If None, will be inferred from optimizer class name.
         is_expert_parallel: Whether the parameter is expert-parallel.
     """
+    import logging
     import nvdlfw_inspect.api as debug_api
+
+    logger = logging.getLogger(__name__)
+
+    # Debug logging - once per iteration
+    global _INSPECT_OPT_PARAM_DEBUG_LOGGED_ITER
+    debug_this_call = (_INSPECT_OPT_PARAM_DEBUG_LOGGED_ITER != iteration)
+    if debug_this_call:
+        _INSPECT_OPT_PARAM_DEBUG_LOGGED_ITER = iteration
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        reduction_group_info = "None"
+        if reduction_group is not None:
+            try:
+                reduction_group_info = f"size={torch.distributed.get_world_size(reduction_group)}"
+            except Exception:
+                reduction_group_info = "error"
+        logger.info(
+            f"[inspect_optimizer_param DEBUG] rank={rank} iter={iteration}\n"
+            f"  param_name={param_name}\n"
+            f"  param.shape={param.shape}\n"
+            f"  grad={'None' if grad is None else f'shape={grad.shape}'}\n"
+            f"  is_distributed_optimizer={is_distributed_optimizer}\n"
+            f"  reduction_group={reduction_group_info}\n"
+            f"  is_expert_parallel={is_expert_parallel}"
+        )
 
     # Auto-detect optimizer type if not provided
     if optimizer_type is None:
@@ -519,6 +581,12 @@ def inspect_optimizer_param(
         _update_next_debug_iter(state, next_iter, iteration)
     else:
         enabled = result
+
+    if debug_this_call:
+        logger.info(
+            f"[inspect_optimizer_param DEBUG] rank={rank} iter={iteration} "
+            f"enabled={enabled} for param={param_name}"
+        )
 
     if enabled:
         debug_api.megatron_core.inspect_optimizer_param(

@@ -247,12 +247,32 @@ class MegatronOptimizer(ABC):
             tp_group=getattr(self, 'tp_group', None),
         )
 
+    _log_optimizer_stats_debug_logged_iter = -1  # Class-level tracker
+
     def log_optimizer_stats(self, iteration: int) -> None:
         """Log per-parameter optimizer statistics via nvdlfw_inspect."""
+        import logging
+        import torch.distributed as dist
+        _logger = logging.getLogger(__name__)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
         if not is_optim_debug_iter(self.optimizer if self.optimizer else self):
+            if MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter != iteration:
+                MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter = iteration
+                _logger.info(
+                    f"[log_optimizer_stats DEBUG] rank={rank} iter={iteration} "
+                    f"SKIP - is_optim_debug_iter returned False"
+                )
             return
 
         if not self._param_names:
+            if MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter != iteration:
+                MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter = iteration
+                _logger.info(
+                    f"[log_optimizer_stats DEBUG] rank={rank} iter={iteration} "
+                    f"SKIP - no _param_names"
+                )
             return
 
         use_decoupled_grad = self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
@@ -263,6 +283,29 @@ class MegatronOptimizer(ABC):
             self.get_grad_stats_parallel_group()
         )
 
+        # Debug log once per iteration
+        if MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter != iteration:
+            MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter = iteration
+            reduction_group = self.get_grad_stats_parallel_group()
+            reduction_group_info = "None"
+            if reduction_group is not None:
+                try:
+                    reduction_group_info = f"size={dist.get_world_size(reduction_group)}"
+                except Exception:
+                    reduction_group_info = "error"
+            _logger.info(
+                f"[log_optimizer_stats DEBUG] rank={rank} iter={iteration} ENTRY\n"
+                f"  use_decoupled_grad={use_decoupled_grad}\n"
+                f"  is_distributed_optimizer={is_distributed_optimizer}\n"
+                f"  reduction_group={reduction_group_info}\n"
+                f"  num_param_groups={len(self.param_groups)}\n"
+                f"  num_param_names={len(self._param_names)}"
+            )
+
+        param_count = 0
+        grad_none_count = 0
+        grad_present_count = 0
+
         for param_group in self.param_groups:
             is_expert_parallel = param_group.get("is_expert_parallel", False)
             for param in param_group.get('params', []):
@@ -270,6 +313,7 @@ class MegatronOptimizer(ABC):
                 if name is None:
                     continue
 
+                param_count += 1
                 model_param = getattr(param, 'model_param', param)
 
                 if use_decoupled_grad:
@@ -278,6 +322,11 @@ class MegatronOptimizer(ABC):
                     grad = getattr(model_param, 'main_grad', None)
                     if grad is None:
                         grad = model_param.grad
+
+                if grad is None:
+                    grad_none_count += 1
+                else:
+                    grad_present_count += 1
 
                 optimizer_state = self.optimizer.state.get(param, {}) if self.optimizer else {}
 
@@ -292,6 +341,12 @@ class MegatronOptimizer(ABC):
                     is_distributed_optimizer=is_distributed_optimizer,
                     is_expert_parallel=is_expert_parallel,
                 )
+
+        # Log summary at end
+        _logger.info(
+            f"[log_optimizer_stats DEBUG] rank={rank} iter={iteration} DONE "
+            f"params={param_count} grad_present={grad_present_count} grad_none={grad_none_count}"
+        )
 
     @abstractmethod
     def zero_grad(self, set_to_none: bool = True):

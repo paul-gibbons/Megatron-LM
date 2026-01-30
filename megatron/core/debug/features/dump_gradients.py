@@ -44,6 +44,7 @@ class DumpWGrads(MCoreConfigAPIMapper):
     def __init__(self):
         super().__init__()
         self._warned_no_save_dir = False
+        self._debug_logged_iteration = -1  # Track which iteration we've logged debug info for
 
     def parse_config_and_api(self, config, **kwargs):
         if kwargs.get("tensor_parsing", False):
@@ -95,10 +96,27 @@ class DumpWGrads(MCoreConfigAPIMapper):
         if not enabled:
             return
 
+        # Debug logging - log once per iteration for first param to avoid spam
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        debug_this_param = (self._debug_logged_iteration != iteration)
+        if debug_this_param:
+            self._debug_logged_iteration = iteration
+            logger.info(
+                f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
+                f"ENTRY layer_name={layer_name} kwargs_keys={list(kwargs.keys())}"
+            )
+
         grad = getattr(param, "main_grad", None)
         if grad is None:
             grad = param.grad
         if grad is None:
+            if debug_this_param:
+                logger.warning(
+                    f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
+                    f"SKIP layer={layer_name} - grad is None! "
+                    f"param.main_grad={getattr(param, 'main_grad', 'NO_ATTR')} "
+                    f"param.grad={param.grad}"
+                )
             return
 
         save_dir = config.get("save_dir")
@@ -107,6 +125,36 @@ class DumpWGrads(MCoreConfigAPIMapper):
         is_expert_parallel = kwargs.get("is_expert_parallel", False)
         skip_expert_all_gather = config.get("skip_expert_all_gather", False)
         effective_group = reduction_group
+
+        if debug_this_param:
+            # Get parallel state info for debugging
+            try:
+                from megatron.core import parallel_state as mpu
+                dp_rank = mpu.get_data_parallel_rank()
+                dp_world = mpu.get_data_parallel_world_size()
+                tp_rank = mpu.get_tensor_model_parallel_rank()
+                pp_rank = mpu.get_pipeline_model_parallel_rank()
+            except Exception as e:
+                dp_rank = dp_world = tp_rank = pp_rank = -1
+                logger.warning(f"[DumpWGrads DEBUG] Could not get parallel state: {e}")
+
+            reduction_group_info = "None"
+            if reduction_group is not None:
+                try:
+                    reduction_group_info = f"size={torch.distributed.get_world_size(reduction_group)}"
+                except Exception:
+                    reduction_group_info = "error_getting_size"
+
+            logger.info(
+                f"[DumpWGrads DEBUG] rank={rank} iter={iteration} layer={layer_name}\n"
+                f"  is_distributed_optimizer={is_distributed_optimizer}\n"
+                f"  reduction_group={reduction_group_info}\n"
+                f"  is_expert_parallel={is_expert_parallel}\n"
+                f"  skip_expert_all_gather={skip_expert_all_gather}\n"
+                f"  grad.shape={grad.shape} grad.dtype={grad.dtype}\n"
+                f"  dp_rank={dp_rank} dp_world={dp_world} tp_rank={tp_rank} pp_rank={pp_rank}"
+            )
+
         if is_expert_parallel:
             try:
                 from megatron.core import parallel_state as mpu
@@ -117,16 +165,47 @@ class DumpWGrads(MCoreConfigAPIMapper):
         if is_expert_parallel and skip_expert_all_gather:
             # Save local shard to avoid large all_gather for expert-parallel weights.
             full_grad = grad
+            if debug_this_param:
+                logger.info(
+                    f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
+                    f"PATH: skip_expert_all_gather - saving local shard"
+                )
         elif is_distributed_optimizer and effective_group is not None:
             world_size = torch.distributed.get_world_size(effective_group)
+            if debug_this_param:
+                logger.info(
+                    f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
+                    f"PATH: distributed_optimizer all_gather - world_size={world_size}"
+                )
             if world_size > 1:
+                if debug_this_param:
+                    logger.info(
+                        f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
+                        f"BEFORE all_gather: grad.shape={grad.shape}"
+                    )
                 gathered_grads = [torch.empty_like(grad) for _ in range(world_size)]
                 torch.distributed.all_gather(gathered_grads, grad, group=effective_group)
                 full_grad = torch.cat(gathered_grads, dim=0)
+                if debug_this_param:
+                    logger.info(
+                        f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
+                        f"AFTER all_gather: full_grad.shape={full_grad.shape}"
+                    )
             else:
                 full_grad = grad
         else:
             full_grad = grad
+            if debug_this_param:
+                logger.info(
+                    f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
+                    f"PATH: no all_gather needed - using grad directly"
+                )
+
+        if debug_this_param:
+            logger.info(
+                f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
+                f"SAVING to {save_dir}/wgrads layer={layer_name} shape={full_grad.shape}"
+            )
 
         save_tensor_direct(
             f"{save_dir}/wgrads", iteration, layer_name, "main_grad", full_grad,
