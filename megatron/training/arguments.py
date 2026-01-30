@@ -1078,6 +1078,10 @@ def validate_args(args, defaults={}):
         assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
             f"NCCL_ALGO must be one of {all_reduce_choices}."
 
+        if args.is_hybrid_model or (args.spec and 'mamba' in ' '.join(args.spec).lower()):
+            assert os.getenv("MAMBA_DETERMINISTIC") == "1", \
+                "MAMBA_DETERMINISTIC=1 required for deterministic Mamba."
+
         torch.use_deterministic_algorithms(True)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
