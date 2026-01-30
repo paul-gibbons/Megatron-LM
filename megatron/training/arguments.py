@@ -1080,7 +1080,7 @@ def validate_args(args, defaults={}):
 
         if args.is_hybrid_model or (args.spec and 'mamba' in ' '.join(args.spec).lower()):
             assert os.getenv("MAMBA_DETERMINISTIC") == "1", \
-                "MAMBA_DETERMINISTIC=1 required for deterministic Mamba."
+                "MAMBA_DETERMINISTIC=1 required for deterministic Mamba. Deterministic mamba is supported in mamba-ssm>=2.3.0 & causal-conv1d>=1.6.0"
 
         torch.use_deterministic_algorithms(True)
 
