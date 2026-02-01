@@ -38,6 +38,9 @@ except ImportError:
 
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
+from ..debug.debug_state import MCoreDebugState
+from ..debug.features.utils.optimizer_stats_buffer import OPTIMIZER_STATS_BUFFERS
+from ..debug.utils import inspect_optimizer_param, is_optim_debug_iter
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -121,6 +124,20 @@ class MegatronOptimizer(ABC):
             )
         self.config = config
         self.init_state_fn = init_state_fn
+        # Store param name mapping for optimizer stats logging
+        self._param_names: Dict[int, str] = {}
+
+    def set_param_names(self, param_groups: List[Dict]) -> None:
+        """Store parameter name mapping from param_groups for optimizer stats logging.
+
+        Args:
+            param_groups: List of param group dicts that may contain 'names' keys.
+        """
+        for group in param_groups:
+            names = group.get('names', [])
+            params = group.get('params', [])
+            for param, name in zip(params, names):
+                self._param_names[id(param)] = name
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
@@ -228,6 +245,107 @@ class MegatronOptimizer(ABC):
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=getattr(self, 'tp_group', None),
+        )
+
+    _log_optimizer_stats_debug_logged_iter = -1  # Class-level tracker
+
+    def log_optimizer_stats(self, iteration: int) -> None:
+        """Log per-parameter optimizer statistics via nvdlfw_inspect."""
+        import logging
+        import torch.distributed as dist
+        _logger = logging.getLogger(__name__)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        if not is_optim_debug_iter(self.optimizer if self.optimizer else self):
+            if MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter != iteration:
+                MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter = iteration
+                _logger.info(
+                    f"[log_optimizer_stats DEBUG] rank={rank} iter={iteration} "
+                    f"SKIP - is_optim_debug_iter returned False"
+                )
+            return
+
+        if not self._param_names:
+            if MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter != iteration:
+                MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter = iteration
+                _logger.info(
+                    f"[log_optimizer_stats DEBUG] rank={rank} iter={iteration} "
+                    f"SKIP - no _param_names"
+                )
+            return
+
+        use_decoupled_grad = self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        is_distributed_optimizer = bool(
+            getattr(self.config, "use_distributed_optimizer", False)
+        )
+        OPTIMIZER_STATS_BUFFERS.set_default_reduction_group(
+            self.get_grad_stats_parallel_group()
+        )
+
+        # Debug log once per iteration
+        if MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter != iteration:
+            MixedPrecisionOptimizer._log_optimizer_stats_debug_logged_iter = iteration
+            reduction_group = self.get_grad_stats_parallel_group()
+            reduction_group_info = "None"
+            if reduction_group is not None:
+                try:
+                    reduction_group_info = f"size={dist.get_world_size(reduction_group)}"
+                except Exception:
+                    reduction_group_info = "error"
+            _logger.info(
+                f"[log_optimizer_stats DEBUG] rank={rank} iter={iteration} ENTRY\n"
+                f"  use_decoupled_grad={use_decoupled_grad}\n"
+                f"  is_distributed_optimizer={is_distributed_optimizer}\n"
+                f"  reduction_group={reduction_group_info}\n"
+                f"  num_param_groups={len(self.param_groups)}\n"
+                f"  num_param_names={len(self._param_names)}"
+            )
+
+        param_count = 0
+        grad_none_count = 0
+        grad_present_count = 0
+
+        for param_group in self.param_groups:
+            is_expert_parallel = param_group.get("is_expert_parallel", False)
+            for param in param_group.get('params', []):
+                name = self._param_names.get(id(param))
+                if name is None:
+                    continue
+
+                param_count += 1
+                model_param = getattr(param, 'model_param', param)
+
+                if use_decoupled_grad:
+                    grad = getattr(model_param, 'decoupled_grad', None)
+                else:
+                    grad = getattr(model_param, 'main_grad', None)
+                    if grad is None:
+                        grad = model_param.grad
+
+                if grad is None:
+                    grad_none_count += 1
+                else:
+                    grad_present_count += 1
+
+                optimizer_state = self.optimizer.state.get(param, {}) if self.optimizer else {}
+
+                inspect_optimizer_param(
+                    optimizer=self.optimizer if self.optimizer else self,
+                    param_name=name,
+                    param=param,
+                    grad=grad,
+                    optimizer_state=optimizer_state,
+                    iteration=iteration,
+                    reduction_group=self.get_grad_stats_parallel_group(),
+                    is_distributed_optimizer=is_distributed_optimizer,
+                    is_expert_parallel=is_expert_parallel,
+                )
+
+        # Log summary at end
+        _logger.info(
+            f"[log_optimizer_stats DEBUG] rank={rank} iter={iteration} DONE "
+            f"params={param_count} grad_present={grad_present_count} grad_none={grad_none_count}"
         )
 
     @abstractmethod
@@ -619,6 +737,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         success = self.step_with_ready_grads()
 
+        # Log optimizer stats if debug is enabled
+        if MCoreDebugState.debug_enabled:
+            self.log_optimizer_stats(MCoreDebugState.get_iteration())
+
         # Successful update.
         return success, grad_norm, num_zeros_in_grad
 
@@ -679,13 +801,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
-                            # Store handle to main_param.
                             param.main_param = main_param
+                            main_param.model_param = param
 
                             fp32_from_float16_params_this_group.append(main_param)
                             # Reset existing state dict key to the new main param.
                             if param in self.optimizer.state:
                                 self.optimizer.state[main_param] = self.optimizer.state.pop(param)
+
                         # fp32 params.
                         elif param.type() == 'torch.cuda.FloatTensor':
                             fp32_params_this_group.append(param)
@@ -778,6 +901,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
         )
 
+    def get_main_param_and_optimizer_states(self, model_param):
+        """Return the main param and optimizer state dict for model_param."""
+        main_param = getattr(model_param, 'main_param', model_param)
+        optim_state = self.optimizer.state[main_param]
+        return {"param": main_param, **optim_state}
+
     def _copy_model_params_to_main_params(self, state_dict=None):
         assert state_dict is None, "Initialize main params from state dict is not supported"
         # Only needed for the float16 params.
@@ -856,11 +985,20 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
 
+        # Save names before loading (load_state_dict may overwrite param_groups)
+        saved_names = [
+            {"names": pg.get("names", [])} for pg in self.optimizer.param_groups
+        ]
+
         # Filter and reorder param groups to match current optimizer
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
             self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
         )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
+
+        # Restore names after loading (for optimizer stats logging)
+        for src, dst in zip(saved_names, self.optimizer.param_groups):
+            dst["names"] = src.get("names", [])
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -989,6 +1127,10 @@ class FP32Optimizer(MegatronOptimizer):
 
         success = self.step_with_ready_grads()
 
+        # Log optimizer stats if debug is enabled
+        if MCoreDebugState.debug_enabled:
+            self.log_optimizer_stats(MCoreDebugState.get_iteration())
+
         # No overflow for FP32 optimizer.
         return success, grad_norm, num_zeros_in_grad
 
@@ -1003,11 +1145,20 @@ class FP32Optimizer(MegatronOptimizer):
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
 
+        # Save names before loading (load_state_dict may overwrite param_groups)
+        saved_names = [
+            {"names": pg.get("names", [])} for pg in self.optimizer.param_groups
+        ]
+
         # Filter and reorder param groups to match current optimizer
         state_dict['param_groups'] = self._filter_and_reorder_param_groups(
             self.optimizer.param_groups, state_dict['param_groups']
         )
         self.optimizer.load_state_dict(state_dict)
+
+        # Restore names after loading (for optimizer stats logging)
+        for src, dst in zip(saved_names, self.optimizer.param_groups):
+            dst["names"] = src.get("names", [])
 
     def sharded_state_dict(
         self,
@@ -1085,6 +1236,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def __init__(self, chained_optimizers: List[MegatronOptimizer]):
         self.model_chunks = []
+        self._param_names: Dict[int, str] = {}  # ChainedOptimizer doesn't use this directly
         # chained_optimizers would be empty in the case that a rank
         # has no trainable parameters
         if chained_optimizers:
@@ -1335,7 +1487,16 @@ class ChainedOptimizer(MegatronOptimizer):
 
         update_successful = self.step_with_ready_grads()
 
+        if MCoreDebugState.debug_enabled:
+            self.log_optimizer_stats(MCoreDebugState.get_iteration())
+
         return update_successful, grad_norm, num_zeros_in_grad
+
+    def log_optimizer_stats(self, iteration: int) -> None:
+        """Log optimizer stats for all chained optimizers."""
+        for optimizer in self.chained_optimizers:
+            if hasattr(optimizer, 'log_optimizer_stats'):
+                optimizer.log_optimizer_stats(iteration)
 
     def save_parameter_state(self, filename: str):
         """Save the distributed parameter states of all optimizers to a file.

@@ -1,0 +1,48 @@
+# Combined FP8 + MCore Tensor Stats
+# Usage: --tensor-inspect --tensor-inspect-config examples/configs/fp8_mcore_combined.yaml
+
+# TE Linear layers (includes expert fc1/fc2, attention projections, etc.)
+# Close-to-zero analysis for NVFP4 vs BF16 convergence (Victor's analysis)
+fp8_stats:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: ".*\\.linear_.*"
+  transformer_engine:
+    LogFp8TensorStats:
+      enabled: True
+      tensors: [weight, gradient]
+      stats: [underflows%]
+      freq: 10
+      start_step: 1
+    LogTensorStats:
+      enabled: True
+      tensors: [weight, wgrad, dgrad]
+      # num_zeros[1e-6]% = percentage of values where |x| < 1e-6
+      stats: [num_zeros%, "num_zeros[1e-10]%","num_zeros[1e-30]%",]
+      freq: 10
+      start_step: 1
+
+# MoE router stats
+mcore_router:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: ".*\\.mlp\\.router"
+  megatron_core:
+    LogMCoreTensorStats:
+      enabled: True
+      tensors: [tokens_per_expert]
+      stats: [per_element%]
+      freq: 10
+      start_step: 1
+
+mcore_io:
+  enabled: True
+  layers:
+    layer_name_regex_pattern: "^(embedding|output_layer)$"
+  megatron_core:
+    LogMCoreTensorStats:
+      enabled: True
+      tensors: [output, input]
+      stats: [min, max, mean]
+      freq: 10
+      start_step: 1
