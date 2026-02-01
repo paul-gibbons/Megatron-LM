@@ -20,6 +20,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from megatron.core.debug.features.utils.dump_io import (
+    get_rank_info as _get_rank_info_impl,
+    get_tensor_dump_iter_dir,
+    should_save_edp,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,37 +62,20 @@ TENSOR_DUMP_STATE = TensorDumpState()
 
 
 def _get_rank_info() -> Tuple[int, int, int, int]:
-    from megatron.core import parallel_state as mpu
-
-    tp_rank = mpu.get_tensor_model_parallel_rank()
-    pp_rank = mpu.get_pipeline_model_parallel_rank()
-    dp_rank = mpu.get_data_parallel_rank()
-    try:
-        ep_rank = mpu.get_expert_model_parallel_rank()
-    except (AssertionError, RuntimeError):
-        ep_rank = 0
-    return tp_rank, pp_rank, dp_rank, ep_rank
+    return _get_rank_info_impl()
 
 
 def _should_save() -> bool:
     """Return True for expert DP rank 0."""
-    from megatron.core import parallel_state as mpu
-    try:
-        edp_rank = mpu.get_expert_data_parallel_rank()
-    except (AssertionError, RuntimeError):
-        edp_rank = mpu.get_data_parallel_rank()
-    return edp_rank == 0
+    return should_save_edp()
 
 
 def _get_iter_dir(save_dir: str, iteration: int) -> str:
-    tp_rank, pp_rank, dp_rank, ep_rank = _get_rank_info()
-    iter_dir = os.path.join(
+    return get_tensor_dump_iter_dir(
         save_dir,
-        f"iter_{iteration:07d}",
-        f"mp_rank_{tp_rank:02d}_{pp_rank:03d}_{ep_rank:03d}"
+        iteration,
+        rank_info=_get_rank_info(),
     )
-    os.makedirs(iter_dir, exist_ok=True)
-    return iter_dir
 
 
 def _sanitize_name(name: str) -> str:

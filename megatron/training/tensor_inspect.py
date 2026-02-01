@@ -188,7 +188,7 @@ def tensor_inspect_end(enabled: bool) -> None:
     if not enabled or not HAVE_NVINSPECT:
         return
 
-    from megatron.core.debug.features.utils.dgrad_logger import remove_dgrad_hooks
+    from megatron.core.debug.features.utils.grad_dump import remove_dgrad_hooks
     remove_dgrad_hooks()
 
     nvinspect_api.end_debug()

@@ -185,7 +185,8 @@ class MegatronCoreAPI(BaseNamespaceAPI):
         )
 
     def step(self):
-        from megatron.core.debug.features.utils.dgrad_logger import save_dgrads
+        from megatron.core.debug.features.utils.grad_dump import save_dgrads
+        from megatron.core.debug.features.dump_gradients import flush_wgrad_buffer
 
         current_iter = MCoreDebugState.get_iteration()
         MCORE_STATS_BUFFERS.log_stats(current_iter)
@@ -194,14 +195,18 @@ class MegatronCoreAPI(BaseNamespaceAPI):
         if TENSOR_DUMP_STATE.has_data() and TENSOR_DUMP_STATE.save_dir:
             save_tensor_dump(TENSOR_DUMP_STATE.save_dir, current_iter)
 
+        # Flush wgrad buffer (saves all shards in one file per rank)
+        flush_wgrad_buffer()
+
         save_dgrads()
 
     def end_debug(self):
-        from megatron.core.debug.features.utils.dgrad_logger import DGRAD_LOGGER
+        from megatron.core.debug.features.utils.grad_dump import DGRAD_LOGGER, WGRAD_BUFFER
 
         MCORE_STATS_BUFFERS.reset()
         OPTIMIZER_STATS_BUFFERS.reset()
         TENSOR_DUMP_STATE.reset()
+        WGRAD_BUFFER.reset()
         DGRAD_LOGGER.reset()
         DGRAD_LOGGER.disable()
         MCoreDebugState._reset()
