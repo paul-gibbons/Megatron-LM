@@ -40,7 +40,7 @@ class LogOptimizerStats(MCoreConfigAPIMapper):
     }
 
     def _validate_stats(self, stats: list) -> None:
-        from megatron.core.debug.features.utils.stats_buffer import parse_num_zeros_stat
+        from megatron.core.debug.features.utils.stats_computation import parse_num_zeros_stat
         for stat in stats:
             if parse_num_zeros_stat(stat) is None and stat.lower() not in self._SUPPORTED_STATS:
                 raise ValueError(f"Unsupported optimizer stat: '{stat}'")

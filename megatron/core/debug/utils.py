@@ -28,6 +28,25 @@ import torch.nn as nn
 from megatron.core.debug.debug_state import MCoreDebugState
 
 
+def matches_pattern(name: str, patterns: Optional[List[str]]) -> bool:
+    """Return True if name matches any glob pattern in the list."""
+    if not patterns or "*" in patterns:
+        return True
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
+
+
+def build_options_tuple(config: dict) -> tuple:
+    """Build the (start_step, end_step, start_end_list) options tuple from config."""
+    start_step = config.get("start_step", None)
+    end_step = config.get("end_step", None)
+    start_end_list = config.get("start_end_list", None)
+    if start_end_list is not None:
+        start_end_list = tuple(
+            tuple(int(x) for x in interval) for interval in start_end_list
+        )
+    return (start_step, end_step, start_end_list)
+
+
 def _get_linear_types() -> tuple:
     """Build tuple of linear layer types to capture gradients from."""
     types: List[type] = [nn.Linear, nn.Embedding]
@@ -78,12 +97,11 @@ LINEAR_TYPES = _get_linear_types()
 def get_reduction_params(
     tensor_name: str,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[bool, Optional[torch.distributed.ProcessGroup], bool]:
+) -> Tuple[bool, Optional[torch.distributed.ProcessGroup]]:
     """Get statistics reduction parameters for a tensor."""
     import nvdlfw_inspect.api as debug_api
 
     skip_reduction = False
-    reduce_within_microbatch = tensor_name.lower() != "weight"
 
     if tensor_name.lower() == "weight":
         if MCoreDebugState.weight_tensor_tp_group_reduce:
@@ -94,46 +112,41 @@ def get_reduction_params(
     else:
         reduction_group = debug_api.get_tensor_reduction_group()
 
-    return skip_reduction, reduction_group, reduce_within_microbatch
+    return skip_reduction, reduction_group
 
 
 @dataclass
-class LayerDebugState:
-    """Debug state for a single layer."""
+class _BaseDebugState:
+    """Base debug state for iteration gating."""
 
     next_debug_iter: Optional[int] = 0
     last_iteration: Optional[int] = None
     enabled_this_iter: bool = False
+
+    def update_for_iteration(self, current_iter: int) -> bool:
+        """Update state for new iteration and return whether debug is enabled."""
+        if self.last_iteration != current_iter:
+            self.enabled_this_iter = (
+                self.next_debug_iter is not None and current_iter >= self.next_debug_iter
+            )
+            self.last_iteration = current_iter
+        return self.enabled_this_iter
+
+
+@dataclass
+class LayerDebugState(_BaseDebugState):
+    """Debug state for a single layer."""
+
     backward_hook_handles: Dict[str, torch.utils.hooks.RemovableHandle] = field(
         default_factory=dict
     )
 
-    def update_for_iteration(self, current_iter: int) -> bool:
-        """Update state for new iteration and return whether debug is enabled."""
-        if self.last_iteration != current_iter:
-            self.enabled_this_iter = (
-                self.next_debug_iter is not None and current_iter >= self.next_debug_iter
-            )
-            self.last_iteration = current_iter
-        return self.enabled_this_iter
-
 
 @dataclass
-class OptimizerDebugState:
+class OptimizerDebugState(_BaseDebugState):
     """Debug state for a single optimizer."""
 
-    next_debug_iter: Optional[int] = 0
-    last_iteration: Optional[int] = None
-    enabled_this_iter: bool = False
-
-    def update_for_iteration(self, current_iter: int) -> bool:
-        """Update state for new iteration and return whether debug is enabled."""
-        if self.last_iteration != current_iter:
-            self.enabled_this_iter = (
-                self.next_debug_iter is not None and current_iter >= self.next_debug_iter
-            )
-            self.last_iteration = current_iter
-        return self.enabled_this_iter
+    pass
 
 
 class TensorInspectRegistry:
@@ -159,7 +172,6 @@ class TensorInspectRegistry:
     @classmethod
     def reset(cls) -> None:
         """Reset all debug state (for testing)."""
-        # Remove any registered hooks before clearing
         for state in cls._layer_state.values():
             for handle in state.backward_hook_handles.values():
                 handle.remove()
@@ -169,14 +181,7 @@ class TensorInspectRegistry:
 
 
 def is_debug_iter(layer_name: str) -> bool:
-    """Check if this iteration should run tensor debug inspection for the layer.
-
-    Args:
-        layer_name: The layer name to check.
-
-    Returns:
-        True if debug inspection should run this iteration.
-    """
+    """Check if this iteration should run tensor debug inspection for the layer."""
     MCoreDebugState.ensure_initialized()
     if not MCoreDebugState.debug_enabled:
         state = TensorInspectRegistry.get_layer_state(layer_name)
@@ -188,26 +193,15 @@ def is_debug_iter(layer_name: str) -> bool:
     return state.update_for_iteration(MCoreDebugState.get_iteration())
 
 
-def inspect_tensor(
+def _inspect_tensor_common(
     layer_name: str,
     tensor_name: str,
     tensor: torch.Tensor,
-    reduction_group: Optional[torch.distributed.ProcessGroup] = None,
+    reduction_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    is_backward: bool,
 ) -> None:
-    """Inspect a tensor and collect statistics.
-
-    This is the main entry point for tensor inspection. It handles:
-    - Iteration gating (only runs on enabled iterations)
-    - Calling the debug API to check if inspection is enabled
-    - Updating next_debug_iter based on API response
-    - Actually collecting tensor stats if enabled
-
-    Args:
-        layer_name: The layer name for debug logging (e.g., "embedding", "decoder.layers.0.mlp.router").
-        tensor_name: The tensor name (e.g., "word", "logits", "router_probs").
-        tensor: The tensor to inspect.
-        reduction_group: Optional process group for tensor parallel reduction.
-    """
+    """Common gating and routing for forward and backward tensor inspection."""
     if not is_debug_iter(layer_name):
         return
 
@@ -226,8 +220,22 @@ def inspect_tensor(
     else:
         enabled = result
 
-    if enabled:
-        skip_reduction, effective_reduction_group, _ = get_reduction_params(
+    if not enabled:
+        return
+
+    if is_backward:
+        dp_reduction_group = debug_api.get_tensor_reduction_group()
+        debug_api.megatron_core.inspect_tensor(
+            layer_name=layer_name,
+            tensor_name=tensor_name,
+            tensor=tensor,
+            iteration=iteration,
+            reduction_group=dp_reduction_group,
+            skip_reduction=dp_reduction_group is None,
+            tp_group=reduction_group,
+        )
+    else:
+        skip_reduction, effective_reduction_group = get_reduction_params(
             tensor_name, tp_group=reduction_group
         )
         debug_api.megatron_core.inspect_tensor(
@@ -240,49 +248,28 @@ def inspect_tensor(
         )
 
 
+def inspect_tensor(
+    layer_name: str,
+    tensor_name: str,
+    tensor: torch.Tensor,
+    reduction_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> None:
+    """Inspect a tensor and collect statistics."""
+    _inspect_tensor_common(
+        layer_name, tensor_name, tensor, reduction_group, is_backward=False
+    )
+
+
 def inspect_backward_tensor(
     layer_name: str,
     tensor_name: str,
     grad: torch.Tensor,
     reduction_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
-    """Inspect a backward tensor (wgrad/dgrad) and collect statistics.
-
-    Args:
-        layer_name: The layer name for debug logging.
-        tensor_name: The tensor name (e.g., "wgrad", "dgrad").
-        grad: The gradient tensor to inspect.
-        reduction_group: Optional process group for tensor parallel reduction.
-    """
-    if not is_debug_iter(layer_name):
-        return
-
-    import nvdlfw_inspect.api as debug_api
-
-    iteration = MCoreDebugState.get_iteration()
-    state = TensorInspectRegistry.get_layer_state(layer_name)
-
-    result = debug_api.megatron_core.inspect_tensor_enabled(
-        layer_name=layer_name, tensor_name=tensor_name, iteration=iteration
+    """Inspect a backward tensor (wgrad/dgrad) and collect statistics."""
+    _inspect_tensor_common(
+        layer_name, tensor_name, grad, reduction_group, is_backward=True
     )
-
-    if isinstance(result, tuple):
-        enabled, next_iter = result
-        _update_next_debug_iter(state, next_iter, iteration)
-    else:
-        enabled = result
-
-    if enabled:
-        dp_reduction_group = debug_api.get_tensor_reduction_group()
-        debug_api.megatron_core.inspect_tensor(
-            layer_name=layer_name,
-            tensor_name=tensor_name,
-            tensor=grad,
-            iteration=iteration,
-            reduction_group=dp_reduction_group,
-            skip_reduction=dp_reduction_group is None,
-            tp_group=reduction_group,
-        )
 
 
 def setup_backward_hooks(
@@ -343,11 +330,7 @@ def setup_backward_hooks(
 
 
 def remove_backward_hooks(layer_name: str) -> None:
-    """Remove all registered backward hooks for a layer.
-
-    Args:
-        layer_name: The layer name whose hooks should be removed.
-    """
+    """Remove all registered backward hooks for a layer."""
     state = TensorInspectRegistry.get_layer_state(layer_name)
     for handle in state.backward_hook_handles.values():
         handle.remove()
@@ -360,13 +343,6 @@ def _unwrap_model(model: Any) -> Any:
     while hasattr(unwrapped, "module"):
         unwrapped = unwrapped.module
     return unwrapped
-
-
-def _matches_layer_pattern(name: str, patterns: Optional[List[str]]) -> bool:
-    """Return True if name matches any pattern."""
-    if not patterns or "*" in patterns:
-        return True
-    return any(fnmatch.fnmatch(name, p) or p == "*" for p in patterns)
 
 
 def register_global_backward_hooks(
@@ -397,7 +373,7 @@ def register_global_backward_hooks(
 
         for module_name, module in unwrapped.named_modules():
             if isinstance(module, module_types):
-                if _matches_layer_pattern(module_name, layer_patterns):
+                if matches_pattern(module_name, layer_patterns):
                     layer_name = f"model_chunk{chunk_id}__{module_name}"
                     hook_fn = hook_factory(layer_name)
                     handle = module.register_full_backward_hook(hook_fn)
@@ -421,11 +397,6 @@ def manage_backward_hooks(
     """Dynamically manage backward hooks based on debug state.
 
     Call this at the start of forward() to set up or remove hooks as needed.
-
-    Args:
-        layer_name: The layer name for debug logging.
-        gradient_targets: Dict mapping tensor_name to module for gradient hooks.
-        reduction_group: Optional process group for tensor parallel reduction.
     """
     MCoreDebugState.ensure_initialized()
     if not MCoreDebugState.debug_enabled:
@@ -443,55 +414,15 @@ def manage_backward_hooks(
             remove_backward_hooks(layer_name)
 
 
-_IS_OPTIM_DEBUG_ITER_LOGGED = {}  # Track logging per iteration
-
-
 def is_optim_debug_iter(optimizer: torch.optim.Optimizer) -> bool:
-    """Check if this iteration should run optimizer debug inspection.
-
-    Args:
-        optimizer: The optimizer to check.
-
-    Returns:
-        True if optimizer debug inspection should run this iteration.
-    """
-    import logging
-    _logger = logging.getLogger(__name__)
-
+    """Check if this iteration should run optimizer debug inspection."""
     MCoreDebugState.ensure_initialized()
-
-    current_iter = MCoreDebugState.get_iteration()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-
-    # Debug log once per iteration
-    should_log = current_iter not in _IS_OPTIM_DEBUG_ITER_LOGGED
-    if should_log:
-        _IS_OPTIM_DEBUG_ITER_LOGGED[current_iter] = True
-        # Keep dict from growing unbounded
-        if len(_IS_OPTIM_DEBUG_ITER_LOGGED) > 100:
-            old_keys = sorted(_IS_OPTIM_DEBUG_ITER_LOGGED.keys())[:-50]
-            for k in old_keys:
-                del _IS_OPTIM_DEBUG_ITER_LOGGED[k]
-
     if not MCoreDebugState.debug_enabled:
-        if should_log:
-            _logger.info(
-                f"[is_optim_debug_iter DEBUG] rank={rank} iter={current_iter} "
-                f"SKIP - debug_enabled=False"
-            )
         return False
 
+    current_iter = MCoreDebugState.get_iteration()
     state = TensorInspectRegistry.get_optim_state(id(optimizer))
-    result = state.update_for_iteration(current_iter)
-
-    if should_log:
-        _logger.info(
-            f"[is_optim_debug_iter DEBUG] rank={rank} iter={current_iter} "
-            f"result={result} next_debug_iter={state.next_debug_iter} "
-            f"enabled_this_iter={state.enabled_this_iter}"
-        )
-
-    return result
+    return state.update_for_iteration(current_iter)
 
 
 def _infer_optimizer_type(optimizer: torch.optim.Optimizer) -> Optional[str]:
@@ -506,9 +437,6 @@ def _infer_optimizer_type(optimizer: torch.optim.Optimizer) -> Optional[str]:
     return None
 
 
-_INSPECT_OPT_PARAM_DEBUG_LOGGED_ITER = -1  # Module-level tracker for debug logging
-
-
 def inspect_optimizer_param(
     optimizer: torch.optim.Optimizer,
     param_name: str,
@@ -521,49 +449,9 @@ def inspect_optimizer_param(
     optimizer_type: Optional[str] = None,
     is_expert_parallel: Optional[bool] = None,
 ) -> None:
-    """Inspect a parameter and collect optimizer statistics.
-
-    Args:
-        optimizer: The optimizer (used to key state).
-        param_name: The parameter name.
-        param: The parameter tensor.
-        grad: The gradient tensor (may be None).
-        optimizer_state: The optimizer state dict for this param.
-        iteration: Current iteration number.
-        reduction_group: Optional process group for reduction.
-        is_distributed_optimizer: Whether this is a distributed optimizer.
-        optimizer_type: Optional optimizer type name (e.g., "muon", "adam").
-            If None, will be inferred from optimizer class name.
-        is_expert_parallel: Whether the parameter is expert-parallel.
-    """
-    import logging
+    """Inspect a parameter and collect optimizer statistics."""
     import nvdlfw_inspect.api as debug_api
 
-    logger = logging.getLogger(__name__)
-
-    # Debug logging - once per iteration
-    global _INSPECT_OPT_PARAM_DEBUG_LOGGED_ITER
-    debug_this_call = (_INSPECT_OPT_PARAM_DEBUG_LOGGED_ITER != iteration)
-    if debug_this_call:
-        _INSPECT_OPT_PARAM_DEBUG_LOGGED_ITER = iteration
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        reduction_group_info = "None"
-        if reduction_group is not None:
-            try:
-                reduction_group_info = f"size={torch.distributed.get_world_size(reduction_group)}"
-            except Exception:
-                reduction_group_info = "error"
-        logger.info(
-            f"[inspect_optimizer_param DEBUG] rank={rank} iter={iteration}\n"
-            f"  param_name={param_name}\n"
-            f"  param.shape={param.shape}\n"
-            f"  grad={'None' if grad is None else f'shape={grad.shape}'}\n"
-            f"  is_distributed_optimizer={is_distributed_optimizer}\n"
-            f"  reduction_group={reduction_group_info}\n"
-            f"  is_expert_parallel={is_expert_parallel}"
-        )
-
-    # Auto-detect optimizer type if not provided
     if optimizer_type is None:
         optimizer_type = _infer_optimizer_type(optimizer)
 
@@ -581,12 +469,6 @@ def inspect_optimizer_param(
         _update_next_debug_iter(state, next_iter, iteration)
     else:
         enabled = result
-
-    if debug_this_call:
-        logger.info(
-            f"[inspect_optimizer_param DEBUG] rank={rank} iter={iteration} "
-            f"enabled={enabled} for param={param_name}"
-        )
 
     if enabled:
         debug_api.megatron_core.inspect_optimizer_param(

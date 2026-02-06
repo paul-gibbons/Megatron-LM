@@ -16,12 +16,12 @@
 
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
 from megatron.core.debug.features.utils.dump_io import (
-    get_rank_info as _get_rank_info_impl,
+    get_rank_info,
     get_tensor_dump_iter_dir,
     should_save_edp,
 )
@@ -61,23 +61,6 @@ class TensorDumpState:
 TENSOR_DUMP_STATE = TensorDumpState()
 
 
-def _get_rank_info() -> Tuple[int, int, int, int]:
-    return _get_rank_info_impl()
-
-
-def _should_save() -> bool:
-    """Return True for expert DP rank 0."""
-    return should_save_edp()
-
-
-def _get_iter_dir(save_dir: str, iteration: int) -> str:
-    return get_tensor_dump_iter_dir(
-        save_dir,
-        iteration,
-        rank_info=_get_rank_info(),
-    )
-
-
 def _sanitize_name(name: str) -> str:
     return name.replace("/", "__").replace("\\", "__").replace(".", "_")
 
@@ -93,10 +76,12 @@ def save_tensor_direct(
     include_microbatch: bool = True,
     track_state: bool = True,
 ) -> None:
-    if not _should_save():
+    if not should_save_edp():
         return
 
-    iter_dir = _get_iter_dir(save_dir, iteration)
+    rank_info = get_rank_info()
+    iter_dir = get_tensor_dump_iter_dir(save_dir, iteration, rank_info=rank_info)
+
     if include_microbatch:
         if microbatch_idx is None:
             microbatch_idx = (
@@ -137,42 +122,3 @@ def save_tensor_dump(save_dir: str, iteration: int) -> None:
             f"tensors to {save_dir}/iter_{iteration:07d}/"
         )
     TENSOR_DUMP_STATE.reset()
-
-
-class TensorDumpBuffer:
-    """Wrapper around TensorDumpState for compatibility."""
-
-    def __init__(self):
-        self._state = TENSOR_DUMP_STATE
-
-    def reset(self):
-        self._state.reset()
-
-    @property
-    def current_iteration(self) -> Optional[int]:
-        return self._state.current_iteration
-
-    @current_iteration.setter
-    def current_iteration(self, value: Optional[int]):
-        self._state.current_iteration = value
-
-    @property
-    def save_dir(self) -> Optional[str]:
-        return self._state.save_dir
-
-    @save_dir.setter
-    def save_dir(self, value: Optional[str]):
-        self._state.save_dir = value
-
-    def add_tensor(self, layer_name: str, tensor_name: str, tensor: torch.Tensor):
-        if self._state.save_dir and self._state.current_iteration is not None:
-            save_tensor_direct(
-                self._state.save_dir,
-                self._state.current_iteration,
-                layer_name,
-                tensor_name,
-                tensor,
-            )
-
-    def has_data(self) -> bool:
-        return self._state.has_data()

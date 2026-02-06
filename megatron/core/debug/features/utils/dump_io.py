@@ -14,8 +14,8 @@
 
 """Shared IO helpers for tensor/grad dumps."""
 
-from typing import Optional, Tuple
 import os
+from typing import Optional, Tuple
 
 
 def get_rank_info() -> Tuple[int, int, int, int]:

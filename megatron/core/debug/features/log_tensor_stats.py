@@ -23,7 +23,9 @@ import nvdlfw_inspect.api as debug_api
 from nvdlfw_inspect.registry import Registry, api_method
 
 from megatron.core.debug.features.api import MCoreConfigAPIMapper
+from megatron.core.debug.utils import build_options_tuple
 from megatron.core.debug.features.utils.stats_buffer import MCORE_STATS_BUFFERS
+from megatron.core.debug.features.utils.stats_computation import parse_num_zeros_stat
 
 
 @Registry.register_feature(namespace="megatron_core")
@@ -41,22 +43,17 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
         Local only (not reducible): median, max_median_ratio, entropy, kurtosis
     """
 
-    _BACKWARD_TENSOR_NAMES = {"wgrad", "dgrad", "gradient"}
     _NON_REDUCIBLE_STATS = {"median", "max_median_ratio", "entropy", "kurtosis"}
     _PER_ELEMENT_TENSOR_NAMES = {"tokens_per_expert"}
     _warned_non_reducible = False
 
-    def __init__(self):
-        super().__init__()
-
-    def _get_supported_stats_list(self) -> set:
-        return {
-            "min", "max", "mean", "std", "sum", "numel", "variance",
-            "median", "max_median_ratio", "kurtosis",
-            "l1_norm", "l2_norm", "cur_amax", "dynamic_range",
-            "entropy", "per_element", "per_element%",
-            "num_zeros", "num_zeros%",
-        }
+    _SUPPORTED_STATS = {
+        "min", "max", "mean", "std", "sum", "numel", "variance",
+        "median", "max_median_ratio", "kurtosis",
+        "l1_norm", "l2_norm", "cur_amax", "dynamic_range",
+        "entropy", "per_element", "per_element%",
+        "num_zeros", "num_zeros%",
+    }
 
     @api_method
     def inspect_tensor_enabled(
@@ -85,18 +82,13 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
 
     def _validate_stats(self, stats: list) -> None:
         """Validate that all requested stats are supported."""
-        from megatron.core.debug.features.utils.stats_computation import (
-            parse_num_zeros_stat,
-        )
-
-        supported = self._get_supported_stats_list()
         for stat in stats:
             if parse_num_zeros_stat(stat) is not None:
                 continue
-            if stat.lower() not in supported:
+            if stat.lower() not in self._SUPPORTED_STATS:
                 raise ValueError(
                     f"[MCore Debug] Unsupported stat: '{stat}'. "
-                    f"Supported stats: {sorted(supported)}"
+                    f"Supported stats: {sorted(self._SUPPORTED_STATS)}"
                 )
 
     def _warn_non_reducible_stats(self, stats: list) -> None:
@@ -171,12 +163,7 @@ class LogMCoreTensorStats(MCoreConfigAPIMapper):
 
         tensor_lower = tensor_name.lower()
         reduce_within_microbatch = tensor_lower not in ("weight",)
-        start_step = config.get("start_step", None)
-        end_step = config.get("end_step", None)
-        start_end_list = config.get("start_end_list", None)
-        if start_end_list is not None:
-            start_end_list = tuple(tuple(int(x) for x in interval) for interval in start_end_list)
-        options = (start_step, end_step, start_end_list)
+        options = build_options_tuple(config)
 
         MCORE_STATS_BUFFERS.try_add_buffer(
             layer_name=layer_name,

@@ -14,16 +14,15 @@
 
 """Gradient dumping features for saving wgrads and dgrads during training."""
 
-import fnmatch
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
 from nvdlfw_inspect.registry import Registry, api_method
 
 from megatron.core.debug.features.api import MCoreConfigAPIMapper
-from megatron.core.debug.features.utils.tensor_dump import save_tensor_direct
+from megatron.core.debug.utils import matches_pattern
 from megatron.core.debug.features.utils.grad_dump import (
     WGRAD_BUFFER,
     DGRAD_LOGGER,
@@ -45,17 +44,11 @@ class DumpWGrads(MCoreConfigAPIMapper):
     def __init__(self):
         super().__init__()
         self._warned_no_save_dir = False
-        self._debug_logged_iteration = -1
 
     def parse_config_and_api(self, config, **kwargs):
         if kwargs.get("tensor_parsing", False):
             return False, None
         return super().parse_config_and_api(config, **kwargs)
-
-    def _matches_pattern(self, name: str, patterns: List[str]) -> bool:
-        if not patterns or "*" in patterns:
-            return True
-        return any(fnmatch.fnmatch(name, p) for p in patterns)
 
     @api_method
     def inspect_optimizer_param_enabled(
@@ -77,7 +70,7 @@ class DumpWGrads(MCoreConfigAPIMapper):
                 self._warned_no_save_dir = True
             return False, next_iter
 
-        if not self._matches_pattern(layer_name, config.get("layers", ["*"])):
+        if not matches_pattern(layer_name, config.get("layers", ["*"])):
             return False, next_iter
 
         return True, next_iter
@@ -96,15 +89,6 @@ class DumpWGrads(MCoreConfigAPIMapper):
         )
         if not enabled:
             return
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        debug_this_param = (self._debug_logged_iteration != iteration)
-        if debug_this_param:
-            self._debug_logged_iteration = iteration
-            logger.info(
-                f"[DumpWGrads DEBUG] rank={rank} iter={iteration} "
-                f"ENTRY layer_name={layer_name} (local shard mode)"
-            )
 
         grad = kwargs.get("grad")
         if grad is None:
@@ -165,11 +149,6 @@ class DumpDGrads(MCoreConfigAPIMapper):
             return True, config_copy
 
         return super().parse_config_and_api(config, **kwargs)
-
-    def _matches_pattern(self, name: str, patterns: List[str]) -> bool:
-        if not patterns or "*" in patterns:
-            return True
-        return any(fnmatch.fnmatch(name, p) for p in patterns)
 
     @api_method
     def inspect_tensor_enabled(

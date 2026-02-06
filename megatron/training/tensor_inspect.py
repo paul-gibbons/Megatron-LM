@@ -139,7 +139,7 @@ def initialize_tensor_inspect_pre_model(
 
 
 def _maybe_register_dgrad_hooks(model: List[Any]) -> None:
-    from megatron.core.debug.features.utils.dgrad_logger import register_dgrad_hooks
+    from megatron.core.debug.features.utils.grad_dump import register_dgrad_hooks
     register_dgrad_hooks(model, layer_patterns=["*"])
 
 

@@ -22,8 +22,8 @@ import torch
 from nvdlfw_inspect.registry import Registry, api_method
 
 from megatron.core.debug.features.api import MCoreConfigAPIMapper
+from megatron.core.debug.utils import build_options_tuple
 from megatron.core.debug.features.utils.stats_buffer import MCORE_STATS_BUFFERS
-from megatron.core.debug.utils import compute_next_enabled_iter
 
 
 @Registry.register_feature(namespace="megatron_core")
@@ -51,15 +51,6 @@ class LogVocabGradientStats(MCoreConfigAPIMapper):
             config_copy.pop("enabled")
         return True, config_copy
 
-    def _check_log_frequency(self, config: Dict, iteration: int) -> Tuple[bool, Optional[int]]:
-        return compute_next_enabled_iter(
-            config.get("start_step", 0),
-            config.get("end_step", -1),
-            config.get("start_end_list"),
-            config.get("freq", 1),
-            iteration,
-        )
-
     @api_method
     def inspect_tensor_enabled(
         self, config: Dict, layer_name: str, tensor_name: str, iteration: int, **kwargs
@@ -86,10 +77,7 @@ class LogVocabGradientStats(MCoreConfigAPIMapper):
         topk = sorted({k for k in topk if k > 0})
         stats = [f"vocab_topk_l2_pct[{k}]" for k in topk]
 
-        start_end_list = config.get("start_end_list", None)
-        if start_end_list is not None:
-            start_end_list = tuple(tuple(int(x) for x in interval) for interval in start_end_list)
-        options = (config.get("start_step", 0), config.get("end_step", -1), start_end_list)
+        options = build_options_tuple(config)
 
         tp_group = kwargs.get("tp_group")
         reduction_group = kwargs.get("reduction_group")

@@ -210,4 +210,3 @@ class MegatronCoreAPI(BaseNamespaceAPI):
         DGRAD_LOGGER.reset()
         DGRAD_LOGGER.disable()
         MCoreDebugState._reset()
-

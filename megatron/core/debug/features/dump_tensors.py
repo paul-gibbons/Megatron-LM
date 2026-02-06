@@ -14,19 +14,17 @@
 
 """DumpTensors feature for saving tensors to disk during training."""
 
-import fnmatch
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
 from nvdlfw_inspect.registry import Registry, api_method
 
 from megatron.core.debug.features.api import MCoreConfigAPIMapper
+from megatron.core.debug.utils import matches_pattern
 from megatron.core.debug.features.utils.tensor_dump import (
-    TensorDumpBuffer,
     TENSOR_DUMP_STATE,
-    save_tensor_dump,
     save_tensor_direct,
 )
 
@@ -40,11 +38,6 @@ class DumpTensors(MCoreConfigAPIMapper):
     def __init__(self):
         super().__init__()
         self._warned_no_save_dir = False
-
-    def _matches_pattern(self, name: str, patterns: List[str]) -> bool:
-        if not patterns or "*" in patterns:
-            return True
-        return any(fnmatch.fnmatch(name, p) for p in patterns)
 
     @api_method
     def inspect_tensor_enabled(
@@ -66,10 +59,10 @@ class DumpTensors(MCoreConfigAPIMapper):
                 self._warned_no_save_dir = True
             return False, next_iter
 
-        if not self._matches_pattern(layer_name, config.get("layers", ["*"])):
+        if not matches_pattern(layer_name, config.get("layers", ["*"])):
             return False, next_iter
 
-        if not self._matches_pattern(tensor_name, config.get("tensors", ["*"])):
+        if not matches_pattern(tensor_name, config.get("tensors", ["*"])):
             return False, next_iter
 
         TENSOR_DUMP_STATE.save_dir = save_dir
@@ -96,18 +89,3 @@ class DumpTensors(MCoreConfigAPIMapper):
             config.get("save_dir"), iteration, layer_name, tensor_name, tensor,
             log_to_metrics=False,
         )
-
-
-def flush_tensor_dumps(iteration: Optional[int] = None) -> None:
-    """Flush tensor dumps to disk at end of iteration."""
-    from megatron.core.debug.debug_state import MCoreDebugState
-
-    MCoreDebugState.ensure_initialized()
-    if not MCoreDebugState.debug_enabled:
-        return
-
-    if iteration is None:
-        iteration = MCoreDebugState.get_iteration()
-
-    if TENSOR_DUMP_STATE.has_data() and TENSOR_DUMP_STATE.save_dir:
-        save_tensor_dump(TENSOR_DUMP_STATE.save_dir, iteration)
