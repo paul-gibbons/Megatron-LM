@@ -119,6 +119,17 @@ class DGradLogger:
         self._model = model
         self._layer_patterns = layer_patterns or ["*"]
 
+    def update_layer_patterns(self, layer_patterns: Optional[List[str]] = None):
+        """Update layer filter patterns and re-register hooks when active."""
+        new_patterns = layer_patterns or ["*"]
+        if new_patterns == self._layer_patterns:
+            return
+
+        self._layer_patterns = new_patterns
+        self._remove_hooks_internal()
+        if self._enabled and self._model is not None:
+            self._register_hooks_internal()
+
     def enable(self, save_dir: str, iteration: int):
         if self._enabled and self._iteration == iteration:
             return

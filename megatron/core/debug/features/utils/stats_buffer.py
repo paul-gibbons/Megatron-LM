@@ -64,7 +64,8 @@ class _MCoreStatsBuffer:
         self.iteration: Optional[int] = None
         self.skip_reduction = False
 
-        self._direct_stats: Dict[str, float] = {}
+        self._direct_stats_sum: Dict[str, float] = defaultdict(float)
+        self._direct_stats_count: Dict[str, int] = defaultdict(int)
         self._per_element_acc: Optional[torch.Tensor] = None
         self._num_zeros_counts: Dict[float, torch.Tensor] = {}
         self._num_zeros_numel: Optional[torch.Tensor] = None
@@ -82,7 +83,8 @@ class _MCoreStatsBuffer:
     def _reset(self):
         self._buffer.zero_()
         self.modified[0] = False
-        self._direct_stats.clear()
+        self._direct_stats_sum.clear()
+        self._direct_stats_count.clear()
         self._per_element_acc = None
         self._num_zeros_counts.clear()
         self._num_zeros_numel = None
@@ -121,7 +123,8 @@ class _MCoreStatsBuffer:
         for stat in self.stats_to_log:
             stat_lower = stat.lower()
             if stat_lower in DIRECT_STATS:
-                self._direct_stats[stat_lower] = DIRECT_STATS[stat_lower](tensor)
+                self._direct_stats_sum[stat_lower] += float(DIRECT_STATS[stat_lower](tensor))
+                self._direct_stats_count[stat_lower] += 1
             elif stat_lower in ("per_element", "per_element%"):
                 flat = tensor.float().flatten().detach()
                 if self._per_element_acc is None:
@@ -168,11 +171,11 @@ class _MCoreStatsBuffer:
         return gathered[mask.flatten().bool()]
 
     def log(self) -> Dict[Tuple, float]:
+        gathered = self._gather_buffers()
         if not self.modified[0]:
             return {}
 
         output = {}
-        gathered = self._gather_buffers()
 
         for stat in self.stats_to_log:
             stat_lower = stat.lower()
@@ -193,8 +196,10 @@ class _MCoreStatsBuffer:
                 self._log_vocab_stat(stat, output)
                 continue
 
-            if stat_lower in self._direct_stats:
-                value = self._direct_stats[stat_lower]
+            if stat_lower in self._direct_stats_sum:
+                count = self._direct_stats_count.get(stat_lower, 0)
+                if count > 0:
+                    value = self._direct_stats_sum[stat_lower] / count
             elif stat_lower in STATS:
                 _, combine_fn = STATS[stat_lower]
                 if combine_fn:
@@ -361,13 +366,33 @@ class MCoreStatsBuffers:
                 return True
         return False
 
+    def _any_rank_should_run_reduction(self, should_run_local: bool) -> bool:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return should_run_local
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        flag = torch.tensor([int(should_run_local)], dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.SUM)
+        return bool(flag.item())
+
     def log_stats(self, current_iter: int) -> Dict[Tuple, float]:
-        if not self._should_run_reduction(current_iter):
+        should_run_local = self._should_run_reduction(current_iter)
+        if not self._any_rank_should_run_reduction(should_run_local):
+            self.at_least_one_fed = False
             return {}
+
         output = {}
-        for buffers in self.reduction_group_to_buffers.values():
+        for reduction_group, buffers in self.reduction_group_to_buffers.items():
             for buffer in buffers:
-                if buffer.modified[0]:
+                if buffer.skip_reduction or reduction_group is None:
+                    should_log = bool(buffer.modified[0].item())
+                else:
+                    changed_mask, _ = gather_along_first_dim(
+                        buffer.modified.unsqueeze(0), process_group=reduction_group
+                    )
+                    should_log = bool(changed_mask.any().item())
+
+                if should_log:
                     output.update(buffer.log())
         self.at_least_one_fed = False
         return output

@@ -59,3 +59,12 @@ class MCoreDebugState:
         if not cls.is_initialized():
             cls.initialize()
 
+    @classmethod
+    def set_weight_tensor_tp_group_reduce(cls, enabled: bool) -> None:
+        """Set whether weight tensors should be TP-group reduced for stats."""
+        cls.weight_tensor_tp_group_reduce = enabled
+
+
+def set_weight_tensor_tp_group_reduce(enabled: bool) -> None:
+    """Set whether weight tensors should be TP-group reduced for stats."""
+    MCoreDebugState.set_weight_tensor_tp_group_reduce(enabled)

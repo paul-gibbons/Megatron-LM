@@ -18,12 +18,16 @@ import os
 from typing import Optional, Tuple
 
 
-def get_rank_info() -> Tuple[int, int, int, int]:
-    """Return (tp_rank, pp_rank, ep_rank, edp_rank)."""
+def get_rank_info() -> Tuple[int, int, int, int, int]:
+    """Return (tp_rank, pp_rank, cp_rank, ep_rank, edp_rank)."""
     from megatron.core import parallel_state as mpu
 
     tp_rank = mpu.get_tensor_model_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
+    try:
+        cp_rank = mpu.get_context_parallel_rank()
+    except (AssertionError, RuntimeError):
+        cp_rank = 0
     try:
         ep_rank = mpu.get_expert_model_parallel_rank()
     except (AssertionError, RuntimeError):
@@ -31,28 +35,28 @@ def get_rank_info() -> Tuple[int, int, int, int]:
     try:
         edp_rank = mpu.get_expert_data_parallel_rank()
     except (AssertionError, RuntimeError):
-        edp_rank = mpu.get_data_parallel_rank()
-    return tp_rank, pp_rank, ep_rank, edp_rank
+        edp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+    return tp_rank, pp_rank, cp_rank, ep_rank, edp_rank
 
 
-def should_save_edp(rank_info: Optional[Tuple[int, int, int, int]] = None) -> bool:
+def should_save_edp(rank_info: Optional[Tuple[int, int, int, int, int]] = None) -> bool:
     if rank_info is None:
         rank_info = get_rank_info()
-    return rank_info[3] == 0
+    return rank_info[4] == 0
 
 
 def get_tensor_dump_iter_dir(
     save_dir: str,
     iteration: int,
-    rank_info: Optional[Tuple[int, int, int, int]] = None,
+    rank_info: Optional[Tuple[int, int, int, int, int]] = None,
 ) -> str:
     if rank_info is None:
         rank_info = get_rank_info()
-    tp_rank, pp_rank, ep_rank, _ = rank_info
+    tp_rank, pp_rank, cp_rank, ep_rank, _ = rank_info
     iter_dir = os.path.join(
         save_dir,
         f"iter_{iteration:07d}",
-        f"mp_rank_{tp_rank:02d}_{pp_rank:03d}_{ep_rank:03d}",
+        f"mp_rank_{tp_rank:02d}_{pp_rank:03d}_{cp_rank:03d}_{ep_rank:03d}",
     )
     os.makedirs(iter_dir, exist_ok=True)
     return iter_dir
@@ -65,17 +69,22 @@ def get_wgrad_iter_dir(save_dir: str, iteration: int) -> str:
 
 
 def get_wgrad_checkpoint_name(
-    rank_info: Optional[Tuple[int, int, int, int]] = None,
+    rank_info: Optional[Tuple[int, int, int, int, int]] = None,
 ) -> str:
     if rank_info is None:
         rank_info = get_rank_info()
-    tp_rank, pp_rank, ep_rank, _ = rank_info
+    tp_rank, pp_rank, cp_rank, ep_rank, _ = rank_info
 
     name = f"mp_rank_{tp_rank:02d}"
     from megatron.core import parallel_state as mpu
     try:
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             name += f"_{pp_rank:03d}"
+    except (AssertionError, RuntimeError):
+        pass
+    try:
+        if mpu.get_context_parallel_world_size() > 1:
+            name += f"_{cp_rank:03d}"
     except (AssertionError, RuntimeError):
         pass
     try:

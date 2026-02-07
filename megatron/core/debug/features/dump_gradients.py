@@ -110,8 +110,6 @@ class DumpWGrads(MCoreConfigAPIMapper):
     def flush_wgrads(self) -> None:
         if WGRAD_BUFFER.has_data:
             WGRAD_BUFFER.flush()
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
 
 
 def flush_wgrad_buffer():
@@ -126,8 +124,6 @@ def flush_wgrad_buffer():
 
     if WGRAD_BUFFER.has_data:
         WGRAD_BUFFER.flush()
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
 
 
 @Registry.register_feature(namespace="megatron_core")
@@ -138,6 +134,17 @@ class DumpDGrads(MCoreConfigAPIMapper):
         super().__init__()
         self._warned_no_save_dir = False
 
+    def _tensor_matches_config(self, config: Dict, tensor_name: str) -> bool:
+        if tensor_name is None:
+            return False
+        if "tensors_struct" in config:
+            for item in config["tensors_struct"]:
+                tensor_pattern = item.get("tensor")
+                if tensor_pattern and matches_pattern(tensor_name, [tensor_pattern]):
+                    return True
+            return False
+        return matches_pattern(tensor_name, config.get("tensors", ["*"]))
+
     def parse_config_and_api(self, config, **kwargs):
         if kwargs.get("param_parsing", False):
             return False, None
@@ -145,6 +152,9 @@ class DumpDGrads(MCoreConfigAPIMapper):
         if kwargs.get("tensor_parsing", False):
             import copy
             config_copy = copy.deepcopy(config)
+            tensor_name = kwargs.get("tensor_name")
+            if not self._tensor_matches_config(config_copy, tensor_name):
+                return False, None
             config_copy.pop("enabled", None)
             return True, config_copy
 
@@ -159,7 +169,7 @@ class DumpDGrads(MCoreConfigAPIMapper):
         iteration: int,
         **kwargs,
     ) -> Tuple[bool, Optional[int]]:
-        del layer_name, tensor_name, kwargs
+        del kwargs
         should_run, next_iter = self._check_log_frequency(config, iteration)
 
         if not should_run:
@@ -172,6 +182,13 @@ class DumpDGrads(MCoreConfigAPIMapper):
                 self._warned_no_save_dir = True
             return False, next_iter
 
+        if not matches_pattern(layer_name, config.get("layers", ["*"])):
+            return False, next_iter
+
+        if not self._tensor_matches_config(config, tensor_name):
+            return False, next_iter
+
+        DGRAD_LOGGER.update_layer_patterns(config.get("layers", ["*"]))
         DGRAD_LOGGER.enable(save_dir, iteration)
         return True, next_iter
 

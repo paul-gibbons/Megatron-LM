@@ -138,9 +138,11 @@ def initialize_tensor_inspect_pre_model(
     print_rank_0("Initialized NVIDIA DLFw Inspect.")
 
 
-def _maybe_register_dgrad_hooks(model: List[Any]) -> None:
+def _maybe_register_dgrad_hooks(
+    model: List[Any], layer_patterns: Optional[List[str]] = None
+) -> None:
     from megatron.core.debug.features.utils.grad_dump import register_dgrad_hooks
-    register_dgrad_hooks(model, layer_patterns=["*"])
+    register_dgrad_hooks(model, layer_patterns=layer_patterns)
 
 
 def finalize_tensor_inspect_post_model(
@@ -149,7 +151,8 @@ def finalize_tensor_inspect_post_model(
     tensorboard_logger: Any = None,
     wandb_logger: Any = None,
     current_training_step: Optional[int] = None,
-    include_context_parallel: bool = False,
+    include_context_parallel: bool = True,
+    dgrad_layer_patterns: Optional[List[str]] = None,
 ) -> None:
     """Finalize tensor inspection after model is created."""
     if not enabled:
@@ -170,7 +173,7 @@ def finalize_tensor_inspect_post_model(
         with_context_parallel=include_context_parallel
     )
     nvinspect_api.set_tensor_reduction_group(reduction_group)
-    _maybe_register_dgrad_hooks(model)
+    _maybe_register_dgrad_hooks(model, layer_patterns=dgrad_layer_patterns)
     print_rank_0("Finalized NVIDIA DLFw Inspect.")
 
 

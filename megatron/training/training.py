@@ -975,6 +975,7 @@ def pretrain(
             tensorboard_logger=get_tensorboard_writer(),
             wandb_logger=get_wandb_writer(),
             current_training_step=args.iteration,
+            include_context_parallel=getattr(args, "context_parallel_size", 1) > 1,
         )
 
     # Data stuff.
