@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.debug.utils import inspect_tensor, manage_backward_hooks
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
@@ -649,16 +650,31 @@ class GPTModel(LanguageModule):
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
 
-                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
+                # Reshape [B, 1, H] to [1, B, H] → extract each sample's true last‐token hidden
                 # state ([B, H]) → unsqueeze back to [B, 1, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
+        layer_name = "output_layer"
+        reduction_group = self.pg_collection.tp if hasattr(self, 'pg_collection') else None
+        gradient_targets = {}
+        if self.share_embeddings_and_output_weights and self.pre_process:
+            if hasattr(self, 'embedding') and hasattr(self.embedding, 'word_embeddings'):
+                gradient_targets["wgrad"] = self.embedding.word_embeddings
+        elif self.post_process:
+            gradient_targets["wgrad"] = getattr(self, 'output_layer', None)
+        if self.post_process:
+            gradient_targets["dgrad"] = getattr(self, 'output_layer', None)
+        manage_backward_hooks(layer_name, gradient_targets, reduction_group=reduction_group)
+        inspect_tensor(layer_name, "input", hidden_states, reduction_group=reduction_group)
+
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        inspect_tensor(layer_name, "logits", logits, reduction_group=reduction_group)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

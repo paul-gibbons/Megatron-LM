@@ -299,6 +299,11 @@ def get_megatron_muon_optimizer(
     else:
         optimizer = FP32Optimizer(optimizer, config, muon_init_state_fn)
 
+    # Set param names for optimizer stats logging (must be after Float16Optimizer wrapping
+    # since it modifies param_groups in-place)
+    if linear_param_groups:
+        optimizer.set_param_names(linear_param_groups)
+
     optimizers.append(optimizer)
 
     # done with muon, unfreeze nonlinear and freeze linear
