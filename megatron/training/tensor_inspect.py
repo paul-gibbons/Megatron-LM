@@ -40,6 +40,17 @@ def _get_default_feature_dirs() -> List[str]:
     except Exception:
         pass
 
+    try:
+        import importlib
+        from pathlib import Path
+
+        mcore_features_mod = importlib.import_module("megatron.core.debug.features")
+        mcore_features_dir = Path(mcore_features_mod.__file__).parent
+        if mcore_features_dir.exists():
+            feature_dirs.append(str(mcore_features_dir))
+    except Exception:
+        pass
+
     return feature_dirs
 
 

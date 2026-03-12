@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.debug.utils import inspect_tensor, manage_backward_hooks
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -597,8 +598,13 @@ class TopKRouter(Router):
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
         """
+        layer_num = self.layer_number if self.layer_number is not None else 0
+        layer_name = f"decoder.layers.{layer_num}.mlp.router"
+
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
+
+        inspect_tensor(layer_name, "router_logits", logits, reduction_group=self.tp_cp_group)
 
         # Flatten padding_mask to [num_tokens] if provided
         if padding_mask is not None:
@@ -624,6 +630,11 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
             )
 
+        inspect_tensor(layer_name, "router_probs", probs, reduction_group=self.tp_cp_group)
+        inspect_tensor(
+            layer_name, "routing_map", routing_map.float(), reduction_group=self.tp_cp_group
+        )
+
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
@@ -644,6 +655,10 @@ class TopKRouter(Router):
                 self.score_function,
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
+            )
+            inspect_tensor(
+                layer_name, "routing_scores", scores_for_aux_loss,
+                reduction_group=self.tp_cp_group,
             )
             probs = self._apply_aux_loss(
                 probs,
@@ -669,6 +684,12 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
+        tokens_per_expert = routing_map.sum(dim=0).float()
+        inspect_tensor(
+            layer_name, "tokens_per_expert", tokens_per_expert,
+            reduction_group=self.tp_cp_group,
+        )
+
         return probs, routing_map
 
     def reset_global_aux_loss_tracker(self):
@@ -688,6 +709,13 @@ class TopKRouter(Router):
                                                    False for padding tokens. Defaults to None.
         """
         self._maintain_float32_expert_bias()
+
+        layer_num = self.layer_number if self.layer_number is not None else 0
+        layer_name = f"decoder.layers.{layer_num}.mlp.router"
+        gradient_targets = {"wgrad": self, "dgrad": self}
+        manage_backward_hooks(layer_name, gradient_targets, reduction_group=self.tp_cp_group)
+
+        inspect_tensor(layer_name, "router_weight", self.weight, reduction_group=self.tp_cp_group)
 
         # Apply input jitter
         input = self.apply_input_jitter(input)

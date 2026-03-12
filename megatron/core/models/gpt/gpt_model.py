@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.debug.utils import inspect_tensor, manage_backward_hooks
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
@@ -650,9 +651,19 @@ class GPTModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
+        layer_name = "output_layer"
+        manage_backward_hooks(
+            layer_name, {"wgrad": self.output_layer}, reduction_group=self.pg_collection.tp
+        )
+        inspect_tensor(
+            layer_name, "input", hidden_states, reduction_group=self.pg_collection.tp
+        )
+
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        inspect_tensor(layer_name, "logits", logits, reduction_group=self.pg_collection.tp)
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
