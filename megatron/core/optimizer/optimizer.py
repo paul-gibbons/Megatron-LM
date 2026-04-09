@@ -490,6 +490,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             return self._scale_one
         return self.grad_scaler.scale
 
+    def _post_inner_optimizer_step(self) -> None:
+        """Optional hook after ``optimizer.step()`` and before main params are copied back."""
+        return None
+
     def reload_model_params(self, state_dict=None):
         if self.param_groups:
             self._copy_model_params_to_main_params(state_dict=state_dict)
@@ -570,6 +574,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             self.optimizer.step()
         if timers is not None:
             timers('optimizer-inner-step').stop()
+        if not self.is_stub_optimizer:
+            self._post_inner_optimizer_step()
 
         # Update params from main params.
         if timers is not None:

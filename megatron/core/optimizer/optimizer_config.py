@@ -8,6 +8,19 @@ import torch
 
 from ..utils import is_te_min_version
 
+OSCI_RESET_METRICS = (
+    "oscillation_ratio",
+    "oscillation_ratio_reduced",
+    "oscillation_l1distqw",
+    "oscillation_l1distw",
+    "oscillation_l1distw_reduced",
+)
+
+OSCI_RESET_TARGETS = (
+    "master_hist_bin_center",
+    "quant_bin_center",
+)
+
 
 @dataclass(frozen=True)
 class ParamPredicate:
@@ -297,6 +310,35 @@ class OptimizerConfig:
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
+    osci_reset: bool = False
+    """If true, reset master weights to the configured TE bin-center target when an oscillation
+       metric crosses the configured threshold on a scheduled OsciReset step. This path is
+       experimental and currently only implemented for the distributed optimizer.
+    """
+
+    osci_reset_metric: str = "oscillation_ratio"
+    """Oscillation metric name to read from Transformer Engine debug persistent state."""
+
+    osci_reset_target: str = "quant_bin_center"
+    """Reset target projection. ``master_hist_bin_center`` uses the 29-bin ``w/scale`` lattice,
+       while ``quant_bin_center`` snaps to the 15-bin NVFP4 quantization centers.
+    """
+
+    osci_reset_threshold: float = 1.0
+    """Apply OsciReset when ``osci_reset_metric`` is greater than or equal to this threshold."""
+
+    osci_reset_start_step: int = 0
+    """Enable OsciReset only from this tensor-inspect iteration onward."""
+
+    osci_reset_period: int = 1
+    """Apply OsciReset only on scheduled iterations within this period."""
+
+    osci_reset_accum_steps: int = 0
+    """Number of scheduled detect-only steps before the reset step within each period."""
+
+    osci_reset_zero_optimizer_state: bool = False
+    """If true, zero tensor optimizer-state entries for parameters that are reset."""
+
     #######################
     # Optimizer Offload
     #######################
@@ -424,6 +466,22 @@ class OptimizerConfig:
             assert (
                 self.exp_avg_sq_dtype == torch.float32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
+
+        if self.osci_reset:
+            assert self.use_distributed_optimizer, '--osci-reset requires distributed optimizer'
+            assert self.osci_reset_metric in OSCI_RESET_METRICS, (
+                f'--osci-reset-metric must be one of {OSCI_RESET_METRICS}'
+            )
+            assert self.osci_reset_target in OSCI_RESET_TARGETS, (
+                f'--osci-reset-target must be one of {OSCI_RESET_TARGETS}'
+            )
+            assert self.osci_reset_threshold >= 0.0, '--osci-reset-threshold must be non-negative'
+            assert self.osci_reset_start_step >= 0, '--osci-reset-start-step must be non-negative'
+            assert self.osci_reset_period > 0, '--osci-reset-period must be positive'
+            assert self.osci_reset_accum_steps >= 0, '--osci-reset-accum-steps must be non-negative'
+            assert self.osci_reset_accum_steps < self.osci_reset_period, (
+                '--osci-reset-accum-steps must be smaller than --osci-reset-period'
+            )
 
 
 @dataclass

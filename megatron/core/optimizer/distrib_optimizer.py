@@ -58,6 +58,158 @@ from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
 
+_TE_OSCI_KEY_ATTR = "_te_osci_key"
+_TE_OSCI_LIVE_METADATA_ATTR = "_te_osci_live_metadata"
+_TENSOR_INSPECT_KEY_ATTR = "_tensor_inspect_key"
+
+
+def _normalize_osci_reset_registry_key(key: Any) -> Optional[Tuple[Any, ...]]:
+    if isinstance(key, tuple):
+        return key
+    if isinstance(key, list):
+        return tuple(key)
+    return None
+
+
+def _get_osci_reset_scalar(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return value.detach().cpu().item()
+
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except (TypeError, ValueError):
+            return None
+
+    return value
+
+
+def _get_te_oscillation_persistent_state_registry():
+    try:
+        from transformer_engine.debug.features.log_nvfp4_tensor_stats import (
+            _OSCILLATION_PERSISTENT_STATE,
+        )
+    except ImportError:
+        return None
+    return _OSCILLATION_PERSISTENT_STATE
+
+
+def _get_te_oscillation_live_metadata_registry():
+    try:
+        from transformer_engine.debug.features.log_nvfp4_tensor_stats import (
+            _OSCILLATION_LIVE_METADATA,
+        )
+    except ImportError:
+        return None
+    return _OSCILLATION_LIVE_METADATA
+
+
+def _get_osci_reset_registry_key(model_param: torch.nn.Parameter) -> Optional[tuple]:
+    key = getattr(model_param, _TE_OSCI_KEY_ATTR, None)
+    if key is None:
+        key = getattr(model_param, _TENSOR_INSPECT_KEY_ATTR, None)
+    if key is None:
+        return None
+    return _normalize_osci_reset_registry_key(key)
+
+
+def _get_osci_reset_metric_value(persistent_state: Optional[dict], metric_name: str) -> Optional[float]:
+    if not isinstance(persistent_state, dict):
+        return None
+    cache = persistent_state.get("_oscillation_cache")
+    if not isinstance(cache, dict):
+        return None
+    metric_value = _get_osci_reset_scalar(cache.get(metric_name))
+    if metric_value is None:
+        return None
+    try:
+        return float(metric_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_osci_reset_metric_iteration(persistent_state: Optional[dict]) -> Optional[int]:
+    if not isinstance(persistent_state, dict):
+        return None
+    metric_iteration = persistent_state.get("_latest_iteration")
+    if metric_iteration is None:
+        cache = persistent_state.get("_oscillation_cache")
+        if isinstance(cache, dict):
+            metric_iteration = cache.get("_iter")
+    metric_iteration = _get_osci_reset_scalar(metric_iteration)
+    if metric_iteration is None:
+        return None
+    try:
+        return int(metric_iteration)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_osci_reset_live_metadata_iteration(live_metadata: Optional[dict]) -> Optional[int]:
+    if not isinstance(live_metadata, dict):
+        return None
+    iteration = _get_osci_reset_scalar(live_metadata.get("iteration"))
+    if iteration is None:
+        return None
+    try:
+        return int(iteration)
+    except (TypeError, ValueError):
+        return None
+
+
+def _should_apply_osci_reset_for_metric_iteration(
+    metric_iteration: int,
+    start_step: int,
+    period: int,
+    accum_steps: int,
+) -> bool:
+    if metric_iteration < start_step:
+        return False
+    return (metric_iteration - start_step) % period == accum_steps
+
+
+def _compute_osci_reset_weight_shard(
+    model_param: torch.Tensor,
+    live_metadata: Optional[dict],
+    param_range: "Range",
+    reset_target: str,
+    dst_dtype: torch.dtype,
+    dst_device: torch.device,
+) -> Optional[torch.Tensor]:
+    if not isinstance(model_param, torch.Tensor):
+        return None
+    if not isinstance(live_metadata, dict):
+        return None
+    scale_inv = live_metadata.get("scale_inv")
+    amax = live_metadata.get("amax")
+    if not isinstance(scale_inv, torch.Tensor) or not isinstance(amax, torch.Tensor):
+        return None
+    try:
+        from transformer_engine.debug.features.utils.stats_computation import (
+            nvfp4_master_hist_bin_center_weight_shard,
+            nvfp4_quant_bin_center_weight_shard,
+        )
+    except ImportError:
+        return None
+    if reset_target == "master_hist_bin_center":
+        projection_fn = nvfp4_master_hist_bin_center_weight_shard
+    elif reset_target == "quant_bin_center":
+        projection_fn = nvfp4_quant_bin_center_weight_shard
+    else:
+        return None
+    return projection_fn(
+        model_param.detach(),
+        scale_inv,
+        amax,
+        flat_start=param_range.start,
+        flat_end=param_range.end,
+        dst_dtype=dst_dtype,
+        dst_device=dst_device,
+    )
+
 
 class Range:
     """
@@ -507,6 +659,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
+        self._optimizer_step_count = 0
+        self._osci_reset_last_applied_iterations = {}
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
@@ -616,6 +770,180 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_range_map = self.gbuf_ranges[gbuf_index][dtype][bucket_index]
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
+
+    def _get_osci_reset_persistent_state(self, model_param: torch.nn.Parameter) -> Optional[dict]:
+        persistent_state = getattr(model_param, "_te_osci_persistent_state", None)
+        if isinstance(persistent_state, dict):
+            return persistent_state
+        registry_key = _get_osci_reset_registry_key(model_param)
+        if registry_key is None:
+            return None
+        registry = _get_te_oscillation_persistent_state_registry()
+        if registry is None:
+            return None
+        return registry.get(registry_key)
+
+    def _get_osci_reset_live_metadata(self, model_param: torch.nn.Parameter) -> Optional[dict]:
+        live_metadata = getattr(model_param, _TE_OSCI_LIVE_METADATA_ATTR, None)
+        if isinstance(live_metadata, dict):
+            return live_metadata
+        registry_key = _get_osci_reset_registry_key(model_param)
+        if registry_key is None:
+            return None
+        registry = _get_te_oscillation_live_metadata_registry()
+        if registry is None:
+            return None
+        live_metadata = registry.get(registry_key)
+        if not isinstance(live_metadata, dict):
+            return None
+        return live_metadata
+
+    def _get_osci_reset_tracking_key(self, model_param: torch.nn.Parameter) -> Any:
+        registry_key = _get_osci_reset_registry_key(model_param)
+        if registry_key is not None:
+            return registry_key
+        return id(model_param)
+
+    def _is_fresh_osci_reset_metric_iteration(
+        self, metric_iteration: int, live_metadata: Optional[dict]
+    ) -> bool:
+        live_iteration = _get_osci_reset_live_metadata_iteration(live_metadata)
+        if live_iteration is None:
+            return False
+        return metric_iteration == live_iteration
+
+    def _maybe_apply_osci_reset_to_param(self, model_param: torch.nn.Parameter) -> Optional[float]:
+        persistent_state = self._get_osci_reset_persistent_state(model_param)
+        live_metadata = self._get_osci_reset_live_metadata(model_param)
+        metric_iteration = _get_osci_reset_metric_iteration(persistent_state)
+        if metric_iteration is None or not self._is_fresh_osci_reset_metric_iteration(
+            metric_iteration, live_metadata
+        ):
+            return None
+        if not _should_apply_osci_reset_for_metric_iteration(
+            metric_iteration=metric_iteration,
+            start_step=self.config.osci_reset_start_step,
+            period=self.config.osci_reset_period,
+            accum_steps=self.config.osci_reset_accum_steps,
+        ):
+            return None
+        tracking_key = self._get_osci_reset_tracking_key(model_param)
+        if self._osci_reset_last_applied_iterations.get(tracking_key) == metric_iteration:
+            return None
+        metric_value = _get_osci_reset_metric_value(
+            persistent_state, self.config.osci_reset_metric
+        )
+        if metric_value is None or metric_value < self.config.osci_reset_threshold:
+            return None
+        if model_param.dim() != 2:
+            return None
+
+        tensors = self._get_main_param_and_optimizer_states(model_param)
+        main_param = tensors.get("param")
+        if not isinstance(main_param, torch.Tensor):
+            return None
+
+        param_range = self._get_model_param_range_map(model_param)["param"]
+        reset_shard = _compute_osci_reset_weight_shard(
+            model_param,
+            live_metadata,
+            param_range,
+            self.config.osci_reset_target,
+            dst_dtype=main_param.dtype,
+            dst_device=main_param.device,
+        )
+        if reset_shard is None or reset_shard.numel() != main_param.numel():
+            return None
+        if reset_shard.shape != main_param.shape:
+            reset_shard = reset_shard.reshape_as(main_param)
+
+        updated_tensors = dict(tensors)
+        updated_tensors["param"] = reset_shard
+        if self.config.osci_reset_zero_optimizer_state:
+            for key, value in tensors.items():
+                if key in ("param", "step") or not isinstance(value, torch.Tensor):
+                    continue
+                updated_tensors[key] = torch.zeros_like(value)
+
+        self._set_main_param_and_optimizer_states(model_param, updated_tensors)
+        self._osci_reset_last_applied_iterations[tracking_key] = metric_iteration
+        return metric_value
+
+    def _apply_osci_reset(self) -> None:
+        if not self.config.osci_reset or self.is_stub_optimizer or self.ddp_config.use_megatron_fsdp:
+            return
+
+        keyed_param_count = 0
+        state_param_count = 0
+        metric_param_count = 0
+        fresh_metric_param_count = 0
+        scheduled_param_count = 0
+        reset_count = 0
+        max_metric_value = float("-inf")
+        max_metric_param_name = None
+
+        for model_group in itertools.chain(self.model_float16_groups, self.model_fp32_groups):
+            for model_param in model_group:
+                if _get_osci_reset_registry_key(model_param) is not None:
+                    keyed_param_count += 1
+                persistent_state = self._get_osci_reset_persistent_state(model_param)
+                if persistent_state is not None:
+                    state_param_count += 1
+                metric_value = _get_osci_reset_metric_value(
+                    persistent_state, self.config.osci_reset_metric
+                )
+                if metric_value is not None:
+                    metric_param_count += 1
+                    live_metadata = self._get_osci_reset_live_metadata(model_param)
+                else:
+                    live_metadata = None
+                metric_iteration = _get_osci_reset_metric_iteration(persistent_state)
+                if metric_iteration is not None and self._is_fresh_osci_reset_metric_iteration(
+                    metric_iteration, live_metadata
+                ):
+                    fresh_metric_param_count += 1
+                    if _should_apply_osci_reset_for_metric_iteration(
+                        metric_iteration=metric_iteration,
+                        start_step=self.config.osci_reset_start_step,
+                        period=self.config.osci_reset_period,
+                        accum_steps=self.config.osci_reset_accum_steps,
+                    ):
+                        scheduled_param_count += 1
+
+                metric_value = self._maybe_apply_osci_reset_to_param(model_param)
+                if metric_value is None:
+                    continue
+                reset_count += 1
+                if metric_value > max_metric_value:
+                    max_metric_value = metric_value
+                    max_metric_param_name = self._param_name(model_param)
+
+        if self._optimizer_step_count == 1:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "OsciReset probe at optimizer step 1: "
+                f"keyed_params={keyed_param_count}, "
+                f"state_params={state_param_count}, "
+                f"metric_params={metric_param_count}, "
+                f"fresh_metric_params={fresh_metric_param_count}, "
+                f"scheduled_params={scheduled_param_count}, "
+                f"reset_params={reset_count}",
+            )
+
+        if reset_count > 0:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "OsciReset applied to "
+                f"{reset_count} parameters at optimizer step {self._optimizer_step_count} "
+                f"using {self.config.osci_reset_metric}>={self.config.osci_reset_threshold} "
+                f"(max={max_metric_value:.6f} on {max_metric_param_name})",
+            )
+
+    def _post_inner_optimizer_step(self) -> None:
+        self._optimizer_step_count += 1
+        self._apply_osci_reset()
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """

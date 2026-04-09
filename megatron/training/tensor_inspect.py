@@ -80,6 +80,22 @@ def _maybe_attach_metric_loggers(tensorboard_logger: Any, wandb_logger: Any) -> 
         print_rank_0(f"Warning: Failed to attach metric loggers to tensor inspection: {e}")
 
 
+def _attach_tensor_inspect_param_metadata(model: List[Any]) -> None:
+    """Attach per-parameter tensor-inspect keys for later runtime lookup."""
+    seen_param_ids = set()
+    for model_chunk in model:
+        for module in model_chunk.modules():
+            layer_name = getattr(module, "name", None)
+            if not layer_name:
+                continue
+            for tensor_name, param in module.named_parameters(recurse=False):
+                if param is None or id(param) in seen_param_ids:
+                    continue
+                if not hasattr(param, "_tensor_inspect_key"):
+                    param._tensor_inspect_key = (layer_name, tensor_name)
+                seen_param_ids.add(id(param))
+
+
 def initialize_tensor_inspect_pre_model(
     enabled: bool,
     features: Optional[dict[str, Any] | str | Path] = None,
@@ -131,6 +147,7 @@ def finalize_tensor_inspect_post_model(
         nvinspect_api.initialize_training_step(int(current_training_step))
 
     nvinspect_api.infer_and_assign_layer_names(model)
+    _attach_tensor_inspect_param_metadata(model)
     nvinspect_api.set_tensor_reduction_group(
         get_tensor_and_data_parallel_group(with_context_parallel=include_context_parallel)
     )

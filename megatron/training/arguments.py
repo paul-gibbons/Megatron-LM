@@ -2598,6 +2598,61 @@ def _add_distributed_args(parser):
                        dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    from megatron.core.optimizer.optimizer_config import OSCI_RESET_METRICS, OSCI_RESET_TARGETS
+
+    group.add_argument(
+        '--osci-reset',
+        action='store_true',
+        help='Experimentally reset distributed optimizer master weights to the current '
+        'tensor-inspect TE-selected bin-center target when the configured '
+        'oscillation metric crosses the threshold on a scheduled reset step.',
+    )
+    group.add_argument(
+        '--osci-reset-metric',
+        type=str,
+        default='oscillation_ratio',
+        choices=OSCI_RESET_METRICS,
+        help='Oscillation metric to compare against --osci-reset-threshold.',
+    )
+    group.add_argument(
+        '--osci-reset-target',
+        type=str,
+        default='quant_bin_center',
+        choices=OSCI_RESET_TARGETS,
+        help='Reset target projection. ``quant_bin_center`` snaps to the 15-bin NVFP4 centers; '
+        '``master_hist_bin_center`` uses the 29-bin w/scale histogram lattice.',
+    )
+    group.add_argument(
+        '--osci-reset-threshold',
+        type=float,
+        default=1.0,
+        help='Apply OsciReset when the selected oscillation metric is greater than or equal to '
+        'this threshold.',
+    )
+    group.add_argument(
+        '--osci-reset-start-step',
+        type=int,
+        default=0,
+        help='Enable OsciReset only from this tensor-inspect iteration onward.',
+    )
+    group.add_argument(
+        '--osci-reset-period',
+        type=int,
+        default=1,
+        help='Apply OsciReset only on scheduled iterations within this period.',
+    )
+    group.add_argument(
+        '--osci-reset-accum-steps',
+        type=int,
+        default=0,
+        help='Number of detect-only iterations before the reset iteration within each '
+        'OsciReset period.',
+    )
+    group.add_argument(
+        '--osci-reset-zero-optimizer-state',
+        action='store_true',
+        help='If set, zero tensor optimizer-state entries for parameters that are reset.',
+    )
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
